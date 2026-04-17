@@ -2,10 +2,10 @@ import SwiftUI
 import Vision
 import AVFoundation
 
-// 整个类标记为 @MainActor，确保 UI 属性安全更新
 @MainActor
 class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    @Published var detectedRects: [VNRectangleObservation] = []
+    // 核心修改：将 [VNRectangleObservation] 改为 [CGRect]，因为 CGRect 是 Sendable 的安全值类型
+    @Published var detectedRects: [CGRect] = []
     
     private let captureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
@@ -39,23 +39,23 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         
         captureSession.commitConfiguration()
         
-        // 异步启动，避免阻塞初始化线程
         Task {
             self.captureSession.startRunning()
         }
         #endif
     }
     
-    // 关键修正：标记为 nonisolated 以满足协议要求，内部手动切换到 MainActor
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
         let request = VNDetectRectanglesRequest { request, error in
-            // 提取结果并转义到主线程
             if let results = request.results as? [VNRectangleObservation] {
-                let capturedResults = results // 捕获局部变量
+                // 核心修改：在后台线程提取纯值类型 CGRect (Sendable)，丢弃无法跨线程的 Vision 对象
+                let boundingBoxes = results.map { $0.boundingBox }
+                
                 Task { @MainActor in
-                    self.detectedRects = capturedResults
+                    // 传递 Sendable 数组，彻底消除 Swift 6 编译报错
+                    self.detectedRects = boundingBoxes
                 }
             }
         }
@@ -68,7 +68,6 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     }
 }
 
-// 预览视图，处理模拟器兼容性
 struct CameraPreviewView: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView(frame: UIScreen.main.bounds)
@@ -97,13 +96,12 @@ struct ContentView: View {
             CameraPreviewView()
                 .ignoresSafeArea()
             
-            // 绘图层：使用 Canvas 提高渲染效率
             Canvas { context, size in
-                for rect in adas.detectedRects {
-                    let drawRect = calculateRect(rect.boundingBox, in: size)
+                // 核心修改：迭代纯 CGRect 数组
+                for box in adas.detectedRects {
+                    let drawRect = calculateRect(box, in: size)
                     context.stroke(Path(drawRect), with: .color(.green), lineWidth: 2)
                     
-                    // 模拟检测标签
                     let text = context.resolve(Text("DETECTED").font(.system(size: 10, weight: .bold)))
                     context.draw(text, at: CGPoint(x: drawRect.midX, y: drawRect.minY - 8))
                 }
@@ -121,7 +119,6 @@ struct ContentView: View {
         }
     }
     
-    // 视觉坐标系转换逻辑
     private func calculateRect(_ box: CGRect, in size: CGSize) -> CGRect {
         let w = box.width * size.width
         let h = box.height * size.height
