@@ -12,13 +12,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Build with xcodebuild
+      - name: Build for Simulator
         run: |
-          # 关键：直接在根目录运行，不指定特定 scheme，让它解析 Package.swift
+          # 使用通用的 iOS Simulator 占位符
           xcodebuild build \
-            -sdk iphonesimulator \
-            -arch arm64 \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -scheme MyADASApp_Swift \
+            -destination "generic/platform=iOS Simulator" \
             -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_ALLOWED=NO
