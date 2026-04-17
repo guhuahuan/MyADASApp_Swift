@@ -1,74 +1,59 @@
 import SwiftUI
+import Vision
 import AVFoundation
 
-// 摄像头预览包装器
-struct CameraPreviewHolder: UIViewRepresentable {
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView(frame: UIScreen.main.bounds)
-        view.backgroundColor = .black // 模拟摄像头背景
-        
-        let label = UILabel()
-        label.text = "摄像头画面占位"
-        label.textColor = .white
-        label.textAlignment = .center
-        label.frame = view.bounds
-        view.addSubview(label)
-        
-        return view
+// 核心逻辑控制器：负责摄像头和推理
+class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    @Published var detectedObjects: [VNRecognizedObjectObservation] = []
+    private var sequenceHandler = VNSequenceRequestHandler()
+    
+    // 这里未来加载你的 YOLO CoreML 模型
+    func setupVision() {
+        // 示例：let model = try? VNCoreMLModel(for: YourYOLOModel().model)
     }
     
-    func updateUIView(_ uiView: UIView, context: Context) {}
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        // 在这里执行推理请求
+        // 推理结果更新到 @Published 变量，驱动 UI 刷新
+    }
 }
 
 struct ContentView: View {
+    @StateObject private var adas = ADASController()
+    
     var body: some View {
         ZStack {
-            // 底层：摄像头预览
-            CameraPreviewHolder()
+            CameraPreviewHolder() // 之前的摄像头组件
                 .ignoresSafeArea()
             
-            // 中层：ADAS 叠加信息
-            VStack {
-                HStack {
-                    HStack {
-                        Circle()
-                            .fill(.green)
-                            .frame(width: 10, height: 10)
-                        Text("ADAS 系统已激活")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundColor(.white)
-                    }
-                    .padding(10)
-                    .background(BlurView(style: .systemUltraThinMaterialDark))
-                    .cornerRadius(10)
+            // 动态检测框绘制
+            Canvas { context, size in
+                for object in adas.detectedObjects {
+                    // 将 Vision 的归一化坐标转换为屏幕坐标
+                    let rect = VNImageRectForNormalizedRect(object.boundingBox, Int(size.width), Int(size.height))
                     
-                    Spacer()
+                    context.stroke(Path(rect), with: .color(.green), lineWidth: 2)
+                    
+                    let label = object.labels.first?.identifier ?? "未知"
+                    let text = context.resolve(Text(label).bold().foregroundColor(.green))
+                    context.draw(text, at: CGPoint(x: rect.midX, y: rect.minY - 15))
                 }
-                .padding()
-                
-                Spacer()
             }
             
-            // 顶层：绘图层（YOLO 检测框模拟）
-            Canvas { context, size in
-                let rect = CGRect(x: size.width * 0.2, y: size.height * 0.35, width: size.width * 0.6, height: size.height * 0.4)
-                
-                // 画检测框
-                context.stroke(Path(rect), with: .color(.red), lineWidth: 3)
-                
-                // 画标签文本 - 修正后的语法
-                let resolvedText = context.resolve(Text("前方车辆 - 距离: 15m").bold().foregroundColor(.red))
-                context.draw(resolvedText, at: CGPoint(x: rect.midX, y: rect.minY - 20))
+            // 安全预警叠加层
+            VStack {
+                if adas.detectedObjects.count > 0 {
+                    Text("警告：前方检测到目标")
+                        .padding()
+                        .background(.red.opacity(0.8))
+                        .cornerRadius(12)
+                        .transition(.move(edge: .top))
+                }
+                Spacer()
             }
+            .padding(.top, 50)
         }
     }
-}
-
-// 辅助视图：毛玻璃效果
-struct BlurView: UIViewRepresentable {
-    var style: UIBlurEffect.Style
-    func makeUIView(context: Context) -> UIVisualEffectView {
-        return UIVisualEffectView(effect: UIBlurEffect(style: style))
-    }
-    func updateUIView(_ uiView: UIVisualEffectView, context: Context) {}
 }
