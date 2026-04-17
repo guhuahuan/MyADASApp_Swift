@@ -2,14 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "MyADASApp",
+    name: "MyADASApp_Swift",
     platforms: [.iOS(.v17)],
     products: [
-        .executable(name: "MyADASApp", targets: ["MyADASApp"])
+        .executable(name: "MyADASApp_Swift", targets: ["MyADASApp_Swift"])
     ],
     targets: [
         .executableTarget(
-            name: "MyADASApp",
+            name: "MyADASApp_Swift",
             path: "Sources"
         )
     ]
+)
