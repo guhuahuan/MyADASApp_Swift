@@ -10,7 +10,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "MyADASApp_Swift",
-            path: "Sources"
+            path: "Sources",
+            swiftSettings: [
+                .unsafeFlags(["-sdk", "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk", "-target", "arm64-apple-ios17.0-simulator"])
+            ]
         )
     ]
 )
