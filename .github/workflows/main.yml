@@ -1,0 +1,20 @@
+name: Swift Build
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: macos-15 # 使用 GitHub 提供的最新 macOS 环境
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Show Swift Version
+        run: swift --version
+
+      - name: Build App
+        run: swift build -c release --triple arm64-apple-ios17.0-macabi
+        # 注意：这里先使用 Mac Catalyst 模式编译测试代码逻辑是否正确
