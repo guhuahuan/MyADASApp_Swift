@@ -2,21 +2,58 @@ import SwiftUI
 import Vision
 import AVFoundation
 
-// 核心逻辑控制器：负责摄像头和推理
+// 核心逻辑控制器：处理摄像头流与 Vision 推理
 class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    @Published var detectedObjects: [VNRecognizedObjectObservation] = []
-    private var sequenceHandler = VNSequenceRequestHandler()
+    @Published var detectedRects: [VNRectangleObservation] = []
     
-    // 这里未来加载你的 YOLO CoreML 模型
-    func setupVision() {
-        // 示例：let model = try? VNCoreMLModel(for: YourYOLOModel().model)
+    private let captureSession = AVCaptureSession()
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let queue = DispatchQueue(label: "adas.vision.queue")
+    
+    override init() {
+        super.init()
+        setupCaptureSession()
     }
     
+    private func setupCaptureSession() {
+        captureSession.beginConfiguration()
+        
+        // 1. 输入：默认摄像头
+        guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+              let videoInput = try? AVCaptureDeviceInput(device: videoDevice) else { return }
+        
+        if captureSession.canAddInput(videoInput) { captureSession.addInput(videoInput) }
+        
+        // 2. 输出：视频帧数据
+        videoOutput.setSampleBufferDelegate(self, queue: queue)
+        if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
+        
+        captureSession.commitConfiguration()
+        
+        // 注意：在真机上需要这一行，但模拟器环境下 Session 不会真的启动
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.captureSession.startRunning()
+        }
+    }
+    
+    // 每一帧画面都会触发这个回调
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        // 在这里执行推理请求
-        // 推理结果更新到 @Published 变量，驱动 UI 刷新
+        // 3. 创建 Vision 请求：检测矩形（作为车辆/障碍物的临时方案）
+        let request = VNDetectRectanglesRequest { [weak self] request, error in
+            guard let results = request.results as? [VNRectangleObservation] else { return }
+            DispatchQueue.main.async {
+                self->detectedRects = results
+            }
+        }
+        
+        // 设置检测参数
+        request.minimumConfidence = 0.5
+        request.maximumObservations = 5
+        
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        try? handler.perform([request])
     }
 }
 
@@ -25,35 +62,35 @@ struct ContentView: View {
     
     var body: some View {
         ZStack {
-            CameraPreviewHolder() // 之前的摄像头组件
-                .ignoresSafeArea()
+            // 背景层：模拟摄像头预览
+            Color.black.ignoresSafeArea()
             
-            // 动态检测框绘制
-            Canvas { context, size in
-                for object in adas.detectedObjects {
-                    // 将 Vision 的归一化坐标转换为屏幕坐标
-                    let rect = VNImageRectForNormalizedRect(object.boundingBox, Int(size.width), Int(size.height))
-                    
-                    context.stroke(Path(rect), with: .color(.green), lineWidth: 2)
-                    
-                    let label = object.labels.first?.identifier ?? "未知"
-                    let text = context.resolve(Text(label).bold().foregroundColor(.green))
-                    context.draw(text, at: CGPoint(x: rect.midX, y: rect.minY - 15))
-                }
-            }
-            
-            // 安全预警叠加层
             VStack {
-                if adas.detectedObjects.count > 0 {
-                    Text("警告：前方检测到目标")
-                        .padding()
-                        .background(.red.opacity(0.8))
-                        .cornerRadius(12)
-                        .transition(.move(edge: .top))
-                }
+                Text("ADAS 系统运行中 (系统内置检测模式)")
+                    .font(.caption)
+                    .foregroundColor(.green)
+                    .padding(5)
+                    .background(.black.opacity(0.5))
                 Spacer()
             }
-            .padding(.top, 50)
+            
+            // 渲染层：根据检测到的目标画框
+            Canvas { context, size in
+                for rect in adas.detectedRects {
+                    // Vision 坐标系（左下角 0,0）转 SwiftUI 坐标系（左上角 0,0）
+                    let width = rect.boundingBox.width * size.width
+                    let height = rect.boundingBox.height * size.height
+                    let x = rect.boundingBox.minX * size.width
+                    let y = (1 - rect.boundingBox.maxY) * size.height
+                    
+                    let drawRect = CGRect(x: x, y: y, width: width, height: height)
+                    
+                    context.stroke(Path(drawRect), with: .color(.green), lineWidth: 2)
+                    
+                    let label = context.resolve(Text("目标已锁定").font(.system(size: 10)).foregroundColor(.green))
+                    context.draw(label, at: CGPoint(x: drawRect.midX, y: drawRect.minY - 10))
+                }
+            }
         }
     }
 }
