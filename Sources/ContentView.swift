@@ -2,7 +2,7 @@ import SwiftUI
 import Vision
 import AVFoundation
 
-// 使用 @MainActor 确保所有属性更新都在主线程安全进行
+// 整个类标记为 @MainActor，确保 UI 属性安全更新
 @MainActor
 class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detectedRects: [VNRectangleObservation] = []
@@ -18,7 +18,7 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     
     private func setupCaptureSession() {
         #if targetEnvironment(simulator)
-        print("模拟器环境：仅加载 UI 框架")
+        print("Simulator detected: Skipping camera hardware init.")
         #else
         captureSession.beginConfiguration()
         
@@ -39,22 +39,24 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         
         captureSession.commitConfiguration()
         
-        Task.detached(priority: .userInitiated) {
+        // 异步启动，避免阻塞初始化线程
+        Task {
             self.captureSession.startRunning()
         }
         #endif
     }
     
-    // 关键修正：非隔离回调处理
+    // 关键修正：标记为 nonisolated 以满足协议要求，内部手动切换到 MainActor
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
         let request = VNDetectRectanglesRequest { request, error in
-            guard let results = request.results as? [VNRectangleObservation] else { return }
-            
-            // 使用 Task 回到 Main Actor 更新 UI
-            Task { @MainActor in
-                self.detectedRects = results
+            // 提取结果并转义到主线程
+            if let results = request.results as? [VNRectangleObservation] {
+                let capturedResults = results // 捕获局部变量
+                Task { @MainActor in
+                    self.detectedRects = capturedResults
+                }
             }
         }
         
@@ -66,6 +68,7 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     }
 }
 
+// 预览视图，处理模拟器兼容性
 struct CameraPreviewView: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView(frame: UIScreen.main.bounds)
@@ -73,7 +76,7 @@ struct CameraPreviewView: UIViewRepresentable {
         
         #if targetEnvironment(simulator)
         let label = UILabel()
-        label.text = "ADAS 模拟器模式"
+        label.text = "ADAS 视觉待命 (模拟器)"
         label.textColor = .green
         label.textAlignment = .center
         label.frame = view.bounds
@@ -94,40 +97,36 @@ struct ContentView: View {
             CameraPreviewView()
                 .ignoresSafeArea()
             
-            // 实时视觉叠加层
+            // 绘图层：使用 Canvas 提高渲染效率
             Canvas { context, size in
                 for rect in adas.detectedRects {
-                    let drawRect = projectRect(rect.boundingBox, to: size)
+                    let drawRect = calculateRect(rect.boundingBox, in: size)
                     context.stroke(Path(drawRect), with: .color(.green), lineWidth: 2)
+                    
+                    // 模拟检测标签
+                    let text = context.resolve(Text("DETECTED").font(.system(size: 10, weight: .bold)))
+                    context.draw(text, at: CGPoint(x: drawRect.midX, y: drawRect.minY - 8))
                 }
             }
             
             VStack {
-                StatusBadge(rectCount: adas.detectedRects.count)
+                Text("Vision 内置检测模式")
+                    .font(.caption)
+                    .padding(6)
+                    .background(Capsule().fill(Color.black.opacity(0.6)))
+                    .foregroundColor(.green)
+                    .padding(.top, 50)
                 Spacer()
             }
         }
     }
     
-    // 坐标转换工具函数
-    private func projectRect(_ box: CGRect, to size: CGSize) -> CGRect {
+    // 视觉坐标系转换逻辑
+    private func calculateRect(_ box: CGRect, in size: CGSize) -> CGRect {
         let w = box.width * size.width
         let h = box.height * size.height
         let x = box.minX * size.width
         let y = (1 - box.maxY) * size.height
         return CGRect(x: x, y: y, width: w, height: h)
-    }
-}
-
-struct StatusBadge: View {
-    let rectCount: Int
-    var body: some View {
-        Text(rectCount > 0 ? "检测到 \(rectCount) 个目标" : "正在扫描...")
-            .font(.system(.caption, design: .monospaced))
-            .padding(8)
-            .background(.black.opacity(0.7))
-            .foregroundColor(.green)
-            .cornerRadius(8)
-            .padding(.top, 40)
     }
 }
