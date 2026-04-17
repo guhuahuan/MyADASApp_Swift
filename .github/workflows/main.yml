@@ -14,10 +14,10 @@ jobs:
 
       - name: Build for Simulator
         run: |
-          # 使用 xcodebuild 自动处理所有 SDK 路径
-          # 我们指定 destination 为模拟器，这样不需要配置 P12 证书也能编译成功
-          xcodebuild -command-line-tool-sdk iphonesimulator \
-            -arch arm64 \
-            -sdk iphonesimulator \
-            -derivedDataPath build \
-            OTHER_SWIFT_FLAGS="-D SKIP_CAMERA" # 预留标记
+          # 使用 xcodebuild 直接构建 Swift Package
+          # -scheme: 默认与你的 Package 名称一致
+          # -destination: 指定为 iOS 模拟器
+          xcodebuild build \
+            -scheme MyADASApp_Swift \
+            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -derivedDataPath build
