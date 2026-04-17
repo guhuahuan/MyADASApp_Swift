@@ -1,4 +1,4 @@
-name: Swift Build
+name: iOS Build Test
 
 on:
   push:
@@ -6,15 +6,18 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15 # 使用 GitHub 提供的最新 macOS 环境
+    runs-on: macos-15
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Show Swift Version
-        run: swift --version
-
-      - name: Build App
+      - name: Build for Simulator
         run: |
-          swift build -c release -Xswiftc "-sdk" -Xswiftc "$(xcrun --sdk iphoneos --show-sdk-path)" -Xswiftc "-target" -Xswiftc "arm64-apple-ios17.0"
+          # 使用 xcodebuild 自动处理所有 SDK 路径
+          # 我们指定 destination 为模拟器，这样不需要配置 P12 证书也能编译成功
+          xcodebuild -command-line-tool-sdk iphonesimulator \
+            -arch arm64 \
+            -sdk iphonesimulator \
+            -derivedDataPath build \
+            OTHER_SWIFT_FLAGS="-D SKIP_CAMERA" # 预留标记
