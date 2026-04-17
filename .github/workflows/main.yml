@@ -16,5 +16,5 @@ jobs:
         run: swift --version
 
       - name: Build App
-        run: swift build -c release --triple arm64-apple-ios17.0-macabi
-        # 注意：这里先使用 Mac Catalyst 模式编译测试代码逻辑是否正确
+        run: |
+          swift build -c release -Xswiftc "-sdk" -Xswiftc "$(xcrun --sdk iphoneos --show-sdk-path)" -Xswiftc "-target" -Xswiftc "arm64-apple-ios17.0"
