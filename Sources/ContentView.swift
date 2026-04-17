@@ -1,38 +1,45 @@
 import SwiftUI
-import Foundation
+import AVFoundation
 
+// 这是一个简化的摄像头预览包装器
+struct CameraPreviewHolder: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: UIScreen.main.bounds)
+        // 实际开发时，这里会初始化 AVCaptureVideoPreviewLayer
+        view.backgroundColor = .darkGray 
+        return view
+    }
+    
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+// 修改你的主界面
 struct ContentView: View {
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            CameraPreviewHolder() // 摄像头背景层
+                .ignoresSafeArea()
             
+            // ADAS 叠加层
             VStack {
-                Text("ADAS 系统已启动")
-                    .font(.headline)
-                    .foregroundColor(.green)
-                    .padding()
-                    .background(Capsule().fill(Color.black.opacity(0.8)))
+                HStack {
+                    Text("车道保持: 激活")
+                        .padding(8)
+                        .background(.green.opacity(0.7))
+                        .cornerRadius(8)
+                    Spacer()
+                }
+                .padding()
                 
                 Spacer()
                 
-                RoundedRectangle(cornerRadius: 15)
-                    .stroke(Color.red, lineWidth: 2)
-                    .frame(width: 200, height: 150)
-                
-                Spacer()
-                
-                Button(action: {
-                    print("开始录制/分析")
-                }) {
-                    Text("开始分析")
-                        .font(.title)
-                        .padding()
-                        .background(Color.blue)
-                        .foregroundColor(.white)
-                        .cornerRadius(15)
+                // 模拟 YOLO 检测框
+                Canvas { context, size in
+                    let rect = CGRect(x: size.width * 0.25, y: size.height * 0.4, width: size.width * 0.5, height: size.height * 0.3)
+                    context.stroke(Path(rect), with: .color(.red), lineWidth: 2)
+                    context.draw(Text("检测到前方车辆").color(.red), at: CGPoint(x: rect.midX, y: rect.minY - 15))
                 }
             }
-            .padding()
         }
     }
 }
