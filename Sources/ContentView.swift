@@ -1,28 +1,27 @@
 import SwiftUI
 import Vision
-@preconcurrency import AVFoundation // 关键：处理非 Sendable 警告
+import AVFoundation
 import CoreML
 
-// 1. 数据模型
-struct Detection: Sendable {
-    let box: CGRect
-    let label: String
+// 1. 扩展检测模型，包含运动状态
+struct TrackedObject: Identifiable {
+    let id: UUID
+    var label: String
+    var currentBox: CGRect
+    var velocity: CGPoint // 运动矢量
+    var history: [CGPoint] // 历史中心点
+    var ttc: Double // 预计碰撞时间
 }
 
-// 2. 核心控制器
 @MainActor
-class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    @Published var detections: [Detection] = []
-    @Published var modelStatus: String = "正在初始化..."
+class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    @Published var trackedObjects: [TrackedObject] = []
+    @Published var systemAlertLevel: Double = 0.0 // 全局风险值 0-1
     
-    // 强制声明为 nonisolated，允许跨线程访问
-    nonisolated let captureSession = AVCaptureSession()
+    let captureSession = AVCaptureSession()
+    private var model: VNCoreMLModel?
     private let videoOutput = AVCaptureVideoDataOutput()
     
-    // 关键修复：使用 nonisolated(unsafe) 避开严格的并发检查
-    // 因为模型加载后是只读的，这样做是安全的
-    nonisolated(unsafe) private var visionModel: VNCoreMLModel?
-
     override init() {
         super.init()
         loadModel()
@@ -30,139 +29,126 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     }
 
     private func loadModel() {
-        do {
+        if let modelURL = Bundle.main.url(forResource: "yolov8s", withExtension: "mlmodelc") {
             let config = MLModelConfiguration()
-            config.computeUnits = .all 
-            if let modelURL = Bundle.main.url(forResource: "yolov8s", withExtension: "mlmodelc") {
-                let compiledModel = try MLModel(contentsOf: modelURL, configuration: config)
-                self.visionModel = try VNCoreMLModel(for: compiledModel)
-                self.modelStatus = "YOLOv8 已激活"
-            } else {
-                self.modelStatus = "使用系统内置检测"
+            config.computeUnits = .all
+            if let m = try? MLModel(contentsOf: modelURL, configuration: config) {
+                self.model = try? VNCoreMLModel(for: m)
             }
-        } catch {
-            self.modelStatus = "模型加载失败"
         }
     }
 
     func setupCapture() {
         captureSession.beginConfiguration()
         captureSession.sessionPreset = .hd1280x720
-        
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device) else { return }
-        
-        if captureSession.canAddInput(input) { captureSession.addInput(input) }
-        
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "camera_queue"))
-        
-        if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
+        captureSession.addInput(input)
+        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "traffic_queue"))
+        captureSession.addOutput(videoOutput)
         captureSession.commitConfiguration()
-        
-        // 既然 session 是 nonisolated，我们可以安全地在后台启动
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.captureSession.startRunning()
-        }
+        DispatchQueue.global().async { self.captureSession.startRunning() }
     }
 
-    // 摄像头回调：标记为 nonisolated
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer), let model = self.model else { return }
         
-        let request: VNImageBasedRequest
-        // 此时访问 visionModel 不再报错，因为标记了 nonisolated(unsafe)
-        if let yolo = self.visionModel {
-            request = VNCoreMLRequest(model: yolo) { [weak self] req, _ in
-                self?.handleResults(req.results)
-            }
-        } else {
-            request = VNDetectRectanglesRequest { [weak self] req, _ in
-                self?.handleResults(req.results)
-            }
+        let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
+            self?.analyzeGlobalScene(req.results as? [VNRecognizedObjectObservation] ?? [])
         }
-        
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
-        try? handler.perform([request])
+        try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right).perform([request])
     }
-    
-    nonisolated private func handleResults(_ results: [Any]?) {
-        let observations = results as? [VNDetectedObjectObservation] ?? []
-        let newDetections = observations.map { obs in
-            Detection(
-                box: obs.boundingBox,
-                label: (obs as? VNRecognizedObjectObservation)?.labels.first?.identifier ?? "Target"
-            )
-        }
+
+    private func analyzeGlobalScene(_ observations: [VNRecognizedObjectObservation]) {
+        let targetLabels = ["person", "car", "bus", "truck", "motorbike"]
         
+        var currentRisk = 0.0
+        let newFrameObjects = observations.compactMap { obs -> TrackedObject? in
+            let label = obs.labels.first?.identifier ?? "obj"
+            guard targetLabels.contains(label) else { return nil }
+            
+            let box = obs.boundingBox
+            let center = CGPoint(x: box.midX, y: box.midY)
+            
+            // 简单的轨迹预判逻辑：寻找上一帧最近的目标进行匹配 (Simple IOU/Distance Match)
+            let prev = self.trackedObjects.first(where: { 
+                abs($0.currentBox.midX - box.midX) < 0.1 && abs($0.currentBox.midY - box.midY) < 0.1 
+            })
+            
+            let velocity = prev != nil ? CGPoint(x: center.x - prev!.history.last!.x, y: center.y - prev!.history.last!.y) : .zero
+            var history = prev?.history ?? []
+            history.append(center)
+            if history.count > 10 { history.removeFirst() }
+            
+            // 计算风险指数：靠近中心且速度快的目标风险更高
+            let distToCenter = sqrt(pow(center.x - 0.5, 2) + pow(center.y - 0.5, 2))
+            if distToCenter < 0.3 { currentRisk += (box.width * box.height) * 2 }
+
+            return TrackedObject(id: prev?.id ?? UUID(), label: label, currentBox: box, velocity: velocity, history: history, ttc: 0)
+        }
+
         Task { @MainActor in
-            self.detections = newDetections
+            self.trackedObjects = newFrameObjects
+            self.systemAlertLevel = min(currentRisk, 1.0)
+            if self.systemAlertLevel > 0.7 { AudioServicesPlaySystemSound(1016) } // 连续报警音
         }
     }
 }
 
-// 3. 画面预览
-struct CameraPreviewHolder: UIViewRepresentable {
-    let session: AVCaptureSession
-    
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView(frame: UIScreen.main.bounds)
-        let layer = AVCaptureVideoPreviewLayer(session: session)
-        layer.frame = UIScreen.main.bounds
-        layer.videoGravity = .resizeAspectFill
-        view.layer.addSublayer(layer)
-        return view
-    }
-    
-    func updateUIView(_ uiView: UIView, context: Context) {
-        DispatchQueue.main.async {
-            if let layer = uiView.layer.sublayers?.first as? AVCaptureVideoPreviewLayer {
-                layer.frame = uiView.bounds
-            }
-        }
-    }
-}
-
-// 4. 主视图
+// 3. UI 界面：全局雷达感官
 struct ContentView: View {
-    @StateObject var controller = ADASController()
+    @StateObject var controller = GlobalTrafficController()
     
     var body: some View {
         ZStack {
-            CameraPreviewHolder(session: controller.captureSession)
-                .ignoresSafeArea()
+            CameraPreviewHolder(session: controller.captureSession).ignoresSafeArea()
             
+            // 全局分析层
             Canvas { context, size in
-                for d in controller.detections {
+                for obj in controller.trackedObjects {
                     let rect = CGRect(
-                        x: d.box.minX * size.width,
-                        y: (1 - d.box.maxY) * size.height,
-                        width: d.box.width * size.width,
-                        height: d.box.height * size.height
+                        x: obj.currentBox.minX * size.width,
+                        y: (1 - obj.currentBox.maxY) * size.height,
+                        width: obj.currentBox.width * size.width,
+                        height: obj.currentBox.height * size.height
                     )
-                    context.stroke(Path(rect), with: .color(.green), lineWidth: 2)
+                    
+                    // 1. 绘制当前框
+                    let color = Color(hue: 0.3 - (controller.systemAlertLevel * 0.3), saturation: 1, brightness: 1)
+                    context.stroke(Path(rect), with: .color(color), lineWidth: 2)
+                    
+                    // 2. 绘制预测轨迹线 (未来 5 帧)
+                    var predictionPath = Path()
+                    predictionPath.move(to: CGPoint(x: rect.midX, y: rect.midY))
+                    predictionPath.addLine(to: CGPoint(
+                        x: rect.midX + (obj.velocity.x * size.width * 5),
+                        y: rect.midY - (obj.velocity.y * size.height * 5)
+                    ))
+                    context.stroke(predictionPath, with: .color(color.opacity(0.6)), style: StrokeStyle(lineWidth: 1, dash: [5]))
                 }
+                
+                // 3. 绘制全场风险雷达边界
+                let scanRect = CGRect(x: size.width*0.2, y: size.height*0.2, width: size.width*0.6, height: size.height*0.6)
+                context.stroke(Path(scanRect), with: .color(.white.opacity(0.2)), lineWidth: 1)
             }
             
+            // 风险仪表盘
             VStack {
-                Text(controller.modelStatus)
-                    .font(.caption.monospaced())
-                    .padding(6)
-                    .background(.black.opacity(0.6))
-                    .foregroundColor(.white)
-                    .cornerRadius(8)
-                    .padding(.top, 40)
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text("系统预判等级").font(.system(.caption, design: .monospaced))
+                        Capsule().fill(.gray.opacity(0.3)).frame(width: 100, height: 6)
+                            .overlay(alignment: .leading) {
+                                Capsule().fill(controller.systemAlertLevel > 0.6 ? .red : .green)
+                                    .frame(width: 100 * CGFloat(controller.systemAlertLevel), height: 6)
+                            }
+                    }
+                    Spacer()
+                    Text("OBJECTS: \(controller.trackedObjects.count)").font(.system(.title3, design: .monospaced).bold())
+                }
+                .padding().background(.black.opacity(0.5)).foregroundColor(.white).cornerRadius(15).padding(20)
                 Spacer()
             }
-        }
-    }
-}
-
-@main
-struct MyADASApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
         }
     }
 }
