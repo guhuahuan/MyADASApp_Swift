@@ -3,7 +3,7 @@ import SwiftUI
 @preconcurrency import AVFoundation
 import CoreML
 
-// 1. 保持 Sendable 结构
+// 1. 显式标记为 Sendable，解决跨线程数据竞争的核心结构
 struct RawDetection: Sendable {
     let box: CGRect
     let label: String
@@ -23,7 +23,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     
     let captureSession = AVCaptureSession()
     
-    // 强制关闭模型并发检查
+    // 强制关闭模型并发检查：模型是只读的，由我们手动担保安全
     nonisolated(unsafe) private var internalModel: VNCoreMLModel?
     private let videoDataQueue = DispatchQueue(label: "video_data_queue", qos: .userInitiated)
 
@@ -61,16 +61,17 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         }
     }
 
+    // 关键：nonisolated 回调，避免主线程阻塞
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let model = self.internalModel else { return }
         
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         
-        let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
+        let request = VNCoreMLRequest(model: model) { req, _ in
             guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
             
-            // 2. 这里的 detections 是在闭包作用域内的局部变量
+            // 提取数据
             let detections = results.map { obs in
                 RawDetection(
                     box: obs.boundingBox,
@@ -78,16 +79,16 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
                 )
             }
             
-            // 3. 核心修复：使用 [detections] 捕获列表显式移交所有权
-            // 这告诉编译器：detections 被复制/移进去了，原作用域不再使用它
-            Task { [detections] @MainActor in
-                self?.updateTracking(with: detections)
+            // 核心修复：通过 Task 捕获 Sendable 数据，并异步切回主线程执行 UI 更新
+            Task { [weak self, detections] in
+                await self?.updateTracking(with: detections)
             }
         }
         
         try? handler.perform([request])
     }
 
+    // 控制器本身是 @MainActor，所以这个方法必须在主线程执行
     private func updateTracking(with newObservations: [RawDetection]) {
         let targetLabels = ["person", "car", "bus", "truck", "motorbike"]
         var totalRisk = 0.0
@@ -102,7 +103,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
             
             let vel = match != nil ? CGPoint(x: center.x - match!.currentBox.midX, y: center.y - match!.currentBox.midY) : .zero
             
-            // 简单的碰撞预警逻辑
+            // 针对越南高密度路况的简易碰撞模型
             if obs.box.midX > 0.3 && obs.box.midX < 0.7 && obs.box.width * obs.box.height > 0.08 {
                 totalRisk += 0.2
             }
@@ -115,7 +116,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     }
 }
 
-// UI 组件
+// MARK: - UI 视图
 struct CameraPreviewHolder: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
@@ -145,6 +146,7 @@ struct ContentView: View {
                     let color: Color = controller.alertLevel > 0.5 ? .red : .green
                     context.stroke(Path(rect), with: .color(color), lineWidth: 2)
                     
+                    // 速度矢量线
                     var line = Path()
                     line.move(to: CGPoint(x: rect.midX, y: rect.midY))
                     line.addLine(to: CGPoint(x: rect.midX + obj.velocity.x * size.width * 10, y: rect.midY - obj.velocity.y * size.height * 10))
