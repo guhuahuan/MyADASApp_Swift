@@ -1,4 +1,4 @@
-name: Build MyADASApp (iOS 26 Hardcore Mode)
+name: Build MyADASApp (iOS 26 Final Strike)
 
 on:
   push:
@@ -18,26 +18,27 @@ jobs:
 
       - name: Hardcore Compilation
         run: |
-          # 1. 查找 SDK 路径
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 2. 直接调用编译器，强行链接 iOS 标准库
-          # 这样能绕过所有 Project/Scheme 的环境检查
+          # 核心修复：加上 -parse-as-library 参数
+          # 并且显式链接所有必要的框架
           swiftc -o MyADASApp_Binary \
             -target arm64-apple-ios17.0 \
             -sdk "$SDK_PATH" \
+            -parse-as-library \
             Sources/*.swift \
-            -O -whole-module-optimization
+            -O -whole-module-optimization \
+            -framework SwiftUI \
+            -framework Vision \
+            -framework AVFoundation \
+            -framework CoreML
 
       - name: Assemble .app for TrollStore
         run: |
           mkdir -p MyADASApp.app
-          
-          # 移动二进制文件并赋予执行权限
           mv MyADASApp_Binary MyADASApp.app/MyADASApp
           chmod +x MyADASApp.app/MyADASApp
           
-          # 创建必要的 Info.plist (TrollStore 需要它来识别入口)
           cat <<EOF > MyADASApp.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -57,11 +58,13 @@ jobs:
               <true/>
               <key>MinimumOSVersion</key>
               <string>17.0</string>
+              <key>UILaunchScreen</key>
+              <dict/>
           </dict>
           </plist>
           EOF
           
-          # 拷贝你的 YOLO 模型
+          # 拷贝模型文件
           cp -r Sources/yolov8s.mlpackage MyADASApp.app/
 
       - name: Final Zip to IPA
@@ -73,5 +76,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyADASApp-iOS26-PureBinary
+          name: MyADASApp-iOS26-Ready
           path: MyADASApp.ipa
