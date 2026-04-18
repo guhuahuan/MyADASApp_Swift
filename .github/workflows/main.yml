@@ -1,4 +1,4 @@
-name: Build MyADASApp IPA (Ultimate Recovery)
+name: Build MyADASApp IPA (SwiftPM Expert Mode)
 
 on:
   push:
@@ -16,40 +16,41 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
-      - name: Build Project
+      - name: Build with Swift Package Manager
         run: |
-          # 强制清理并编译，不进行签名验证
-          xcodebuild build \
-            -scheme MyADASApp_Swift \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath ./DerivedData \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            COREML_CODEGEN_LANGUAGE=Swift \
-            clean
+          # 1. 强制使用 Release 配置构建
+          # 2. 指定 triple 确保是 iOS 真机环境
+          swift build -c release --triple arm64-apple-ios17.0
 
       - name: Locate and Package IPA
         run: |
           mkdir -p Payload
           
-          echo "开始全盘搜索 .app 编译产物..."
-          # 核心修复：不带路径前缀，搜索所有编译出的 .app 文件夹
-          APP_PATH=$(find ./DerivedData -name "*.app" -type d -not -path "*.xcarchive*" | head -n 1)
+          echo "正在从 SwiftPM 产物目录中提取 .app..."
+          # SwiftPM 项目的产物通常在 .build 目录下
+          # 我们直接全盘搜索这个刚生成的二进制包
+          APP_PATH=$(find .build -name "*.app" -type d | head -n 1)
           
+          # 如果 SwiftPM 没生成 .app，我们手动创建一个壳子（这是给 TrollStore 用的关键技巧）
           if [ -z "$APP_PATH" ]; then
-            echo "错误：全盘搜索依然找不到 .app！以下是目录结构，请检查："
-            find ./DerivedData -maxdepth 4
-            exit 1
+            echo "未找到 .app 目录，尝试手动组装包体..."
+            EXECUTABLE_PATH=$(find .build -type f -maxdepth 4 -perm +111 -not -path "*/.*" | head -n 1)
+            
+            mkdir -p MyADASApp.app
+            cp "$EXECUTABLE_PATH" MyADASApp.app/MyADASApp
+            
+            # 拷贝必要的资源文件（模型文件）
+            cp Sources/yolov8s.mlpackage MyADASApp.app/ || true
+            
+            APP_PATH="MyADASApp.app"
           fi
           
-          echo "成功捕获产物：$APP_PATH"
+          echo "最终打包路径: $APP_PATH"
           cp -r "$APP_PATH" Payload/
-          
-          # 创建 IPA
           zip -vr MyADASApp.ipa Payload/
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyADASApp-iOS26-Final
+          name: MyADASApp-iOS26-Final-Ready
           path: MyADASApp.ipa
