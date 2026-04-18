@@ -3,7 +3,6 @@ import Vision
 @preconcurrency import AVFoundation
 import CoreML
 
-// 1. 定义 Sendable 数据结构，确保跨线程传输安全
 struct TrackedObject: Identifiable, Sendable {
     let id: UUID
     let label: String
@@ -54,30 +53,21 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         }
     }
 
-    // 关键修正：在 nonisolated 环境下安全处理
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        
-        // 步骤 A: 立即在后台执行 Vision 请求，不跨线程传递 pixelBuffer
-        // 我们通过 run 函数在主线程取回模型引用，但这必须极快
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         
         Task {
-            // 在主线程安全获取模型引用
-            guard let model = await MainActor.run(resultType: VNCoreMLModel?.self, {
-                return self.internalModel 
-            }) else { return }
+            // 关键修复：使用最简洁的闭包语法，Swift 会自动推断返回类型
+            guard let model = await MainActor.run(body: { self.internalModel }) else { return }
             
-            // 步骤 B: 在后台异步执行推理
             let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
                 guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
                 
-                // 将结果转为 Sendable 类型 (CGRect, String)
                 let detections = results.map { (obs: VNRecognizedObjectObservation) -> (CGRect, String) in
                     return (obs.boundingBox, obs.labels.first?.identifier ?? "obj")
                 }
                 
-                // 步骤 C: 只将纯数据传回主线程进行轨迹关联
                 Task { @MainActor in
                     self?.updateTracking(with: detections)
                 }
@@ -94,7 +84,6 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
             guard targetLabels.contains(label) else { return nil }
             let center = CGPoint(x: box.midX, y: box.midY)
             
-            // 轨迹匹配
             let match = self.trackedObjects.first(where: { 
                 abs($0.currentBox.midX - box.midX) < 0.15 && abs($0.currentBox.midY - box.midY) < 0.15 
             })
@@ -113,7 +102,6 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     }
 }
 
-// UI 部分代码保持稳定
 struct CameraPreviewHolder: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
