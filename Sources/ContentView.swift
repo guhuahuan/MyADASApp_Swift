@@ -1,6 +1,6 @@
 import SwiftUI
 import Vision
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreML
 
 struct Detection: Sendable {
@@ -12,14 +12,13 @@ struct Detection: Sendable {
 class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detections: [Detection] = []
     
-    // 使用 nonisolated 让后台线程可以访问，不触发 Actor 报错
-    nonisolated let captureSession: AVCaptureSession = AVCaptureSession()
+    // 使用 nonisolated(unsafe) 绕过 Swift 6 的 Sendable 检查
+    nonisolated(unsafe) let captureSession: AVCaptureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
-    nonisolated private(set) var model: VNCoreMLModel?
+    nonisolated(unsafe) private(set) var model: VNCoreMLModel?
 
     override init() {
         super.init()
-        // 在初始化时加载，此时还在主线程环境
         loadModel()
         setupCapture()
     }
@@ -31,7 +30,6 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             if let modelURL = Bundle.main.url(forResource: "yolov8s", withExtension: "mlmodelc") {
                 let compiledModel = try MLModel(contentsOf: modelURL, configuration: config)
                 self.model = try VNCoreMLModel(for: compiledModel)
-                print("✅ YOLOv8 Loaded")
             }
         } catch {
             print("❌ Model Error: \(error)")
@@ -42,21 +40,24 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         captureSession.beginConfiguration()
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device) else { return }
+        
         if captureSession.canAddInput(input) { captureSession.addInput(input) }
+        
         videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "video_queue"))
         if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
+        
         captureSession.commitConfiguration()
         
+        // 放在后台线程启动摄像头，避免卡顿
+        let session = self.captureSession
         DispatchQueue.global(qos: .userInitiated).async {
-            self.captureSession.startRunning()
+            session.startRunning()
         }
     }
 
-    // 处理摄像头每一帧的输出
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        // 如果 YOLO 模型加载了就用 YOLO，否则保持空结果
         let request: VNImageBasedRequest
         if let visionModel = self.model {
             request = VNCoreMLRequest(model: visionModel) { [weak self] req, _ in
@@ -67,7 +68,6 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
                 }
             }
         } else {
-            // 兜底方案：如果模型没加载，使用简单的矩形检测，避免报错
             request = VNDetectRectanglesRequest { [weak self] req, _ in
                 let results = req.results as? [VNRectangleObservation] ?? []
                 let boxes = results.map { Detection(box: $0.boundingBox, label: "Scanning...") }
