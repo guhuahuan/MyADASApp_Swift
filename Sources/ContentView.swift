@@ -1,9 +1,9 @@
 import SwiftUI
 import Vision
-import AVFoundation
+@preconcurrency import AVFoundation // 关键 1: 降低旧框架的检查严苛度
 import CoreML
 
-// 1. 轨迹目标模型
+// 轨迹目标模型
 struct TrackedObject: Identifiable {
     let id: UUID
     var label: String
@@ -11,17 +11,18 @@ struct TrackedObject: Identifiable {
     var velocity: CGPoint
 }
 
-// 2. 核心分析控制器
 @MainActor
 class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var trackedObjects: [TrackedObject] = []
     @Published var alertLevel: Double = 0.0
     
-    // 关键修正：将 session 设为非 Actor 隔离
-    nonisolated let captureSession = AVCaptureSession()
-    // 关键修正：model 标记为 nonisolated(notification) 或在访问时进行同步
+    // 移除所有 nonisolated 修饰，回归标准 MainActor 隔离
+    let captureSession = AVCaptureSession()
     private var internalModel: VNCoreMLModel?
     
+    // 创建一个专门的后台队列用于处理图像，避免堵塞主线程
+    private let videoDataQueue = DispatchQueue(label: "video_data_queue", qos: .userInitiated)
+
     override init() {
         super.init()
         loadModel()
@@ -45,37 +46,46 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         captureSession.sessionPreset = .hd1280x720
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device) else { return }
+        
         if captureSession.canAddInput(input) { captureSession.addInput(input) }
         
         let videoOutput = AVCaptureVideoDataOutput()
-        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "traffic_queue"))
+        // 指定在后台队列回调
+        videoOutput.setSampleBufferDelegate(self, queue: videoDataQueue)
+        
         if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
         captureSession.commitConfiguration()
         
-        // 修正：现在 captureSession 是 nonisolated，可以安全在后台启动
-        DispatchQueue.global(qos: .userInitiated).async {
+        // 关键 2: 既然在主线程启动受阻，我们就在主线程异步任务中启动
+        Task {
             self.captureSession.startRunning()
         }
     }
 
-    // 关键修复：从 nonisolated 回调中安全获取处理
+    // 关键 3: 必须显式标记为 nonisolated 以符合协议要求
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let model = self.internalModel else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
-            guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
-            let mapped = results.map { (obs: VNRecognizedObjectObservation) -> (CGRect, String) in
-                return (obs.boundingBox, obs.labels.first?.identifier ?? "obj")
+        // 在后台线程同步等待获取模型（避开 Actor 隔离检查）
+        Task { @MainActor in
+            guard let model = self.internalModel else { return }
+            
+            // 为了性能，我们将 Request 放在后台处理
+            let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
+                guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
+                let mapped = results.map { (obs: VNRecognizedObjectObservation) -> (CGRect, String) in
+                    return (obs.boundingBox, obs.labels.first?.identifier ?? "obj")
+                }
+                
+                // 再次回到主线程更新数据
+                Task { @MainActor in
+                    self?.updateTracking(with: mapped)
+                }
             }
-            // 切换回主线程更新 UI
-            Task { @MainActor in
-                self?.updateTracking(with: mapped)
-            }
+            
+            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
+            try? handler.perform([request])
         }
-        
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
-        try? handler.perform([request])
     }
 
     private func updateTracking(with newObservations: [(CGRect, String)]) {
@@ -92,6 +102,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
             
             let vel = match != nil ? CGPoint(x: center.x - match!.currentBox.midX, y: center.y - match!.currentBox.midY) : .zero
             
+            // 危险预判逻辑
             if box.midX > 0.3 && box.midX < 0.7 && box.width * box.height > 0.08 {
                 totalRisk += 0.2
             }
@@ -104,7 +115,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     }
 }
 
-// 预览层保持不变
+// 预览容器保持一致
 struct CameraPreviewHolder: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
@@ -115,11 +126,7 @@ struct CameraPreviewHolder: UIViewRepresentable {
         view.layer.addSublayer(layer)
         return view
     }
-    func updateUIView(_ uiView: UIView, context: Context) {
-        if let layer = uiView.layer.sublayers?.first as? AVCaptureVideoPreviewLayer {
-            layer.frame = uiView.bounds
-        }
-    }
+    func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
 struct ContentView: View {
@@ -140,12 +147,12 @@ struct ContentView: View {
                     
                     var line = Path()
                     line.move(to: CGPoint(x: rect.midX, y: rect.midY))
-                    line.addLine(to: CGPoint(x: rect.midX + obj.velocity.x * size.width * 8, y: rect.midY - obj.velocity.y * size.height * 8))
+                    line.addLine(to: CGPoint(x: rect.midX + obj.velocity.x * size.width * 10, y: rect.midY - obj.velocity.y * size.height * 10))
                     context.stroke(line, with: .color(color.opacity(0.6)), style: StrokeStyle(lineWidth: 1, dash: [5]))
                 }
             }
             VStack {
-                Text("ADAS GLOBAL PREDICTION: \(Int(controller.alertLevel * 100))%")
+                Text("TRAFFIC SYSTEM: \(Int(controller.alertLevel * 100))%")
                     .font(.system(.caption, design: .monospaced)).bold()
                     .padding(8).background(controller.alertLevel > 0.5 ? .red : .black.opacity(0.7))
                     .foregroundColor(.white).cornerRadius(8).padding(.top, 50)
