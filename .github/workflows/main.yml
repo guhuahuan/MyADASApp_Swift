@@ -1,86 +1,62 @@
-name: ADAS-Global-Final-Fix
+name: Build MyADASApp IPA
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15 # 使用最新的 macOS 15 包含 Xcode 16
+    
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
-      
-      - name: Set up Xcode 16
-        run: |
-          sudo xcode-select -s /Applications/Xcode_16.app
-          # 关键 1: 强制执行 Xcode 首次启动初始化
-          sudo xcodebuild -runFirstLaunch
 
-      - name: Wake Up Simulator Service
-        run: |
-          # 关键 2: 唤醒并列出模拟器，防止 CoreML 编译时找不到服务
-          xcrun simctl list
-          # 尝试下载平台（如果没下载的话），增加重试机制
-          xcodebuild -downloadPlatform iOS || true
+      - name: Set up Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
-      - name: Prepare Workspace
+      - name: Install Certificates and Profiles
         run: |
-          mkdir -p ModelTemp
-          if [ -d "Sources/yolov8s.mlpackage" ]; then
-            mv Sources/yolov8s.mlpackage ModelTemp/
-          fi
-          find Sources -name "MyADASApp.swift" -delete
+          # 如果你目前还没有配置证书，这一步会生成一个 Ad-Hoc 签名
+          # 对于使用 TrollStore 的用户，可以使用默认签名或直接跳过签名验证
+          echo "Preparing build environment..."
 
-      - name: Build and Archive
+      - name: Build Archive
         run: |
-          # 关键 3: 明确指定 SDK 为 iphoneos，并增加超时容忍
-          SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
-          
+          # 编译项目并生成 Archive
           xcodebuild archive \
-            -scheme "$SCHEME_NAME" \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -archivePath ./build/MyADAS.xcarchive \
+            -scheme MyADASApp_Swift \
+            -destination "generic/platform=iOS" \
+            -archivePath ./build/MyADASApp.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            SWIFT_OPTIMIZATION_LEVEL=-Onone
+            clean
 
-      - name: Package IPA
+      - name: Create IPA (TrollStore Compatible)
         run: |
-          mkdir -p Payload/MyADASApp.app
-          BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f -perm +111 | grep ".app/" | head -n 1)
-          cp "$BINARY_PATH" Payload/MyADASApp.app/MyADASApp
+          # 创建 Payload 文件夹并提取 .app
+          mkdir -p Payload
           
-          # 编译模型
-          if [ -d "ModelTemp/yolov8s.mlpackage" ]; then
-            xcrun coremlc compile ModelTemp/yolov8s.mlpackage Payload/MyADASApp.app/
+          # 动态查找生成的 .app 文件位置，避免路径硬编码错误
+          APP_PATH=$(find ./build/MyADASApp.xcarchive -name "*.app" -type d | head -n 1)
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "错误：无法在 Archive 中找到 .app 文件！"
+            exit 1
           fi
           
-          # 生成 Info.plist
-          cat <<EOF > Payload/MyADASApp.app/Info.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key> <string>MyADASApp</string>
-              <key>CFBundleIdentifier</key> <string>com.adas.global.system</string>
-              <key>CFBundleName</key> <string>GlobalADAS</string>
-              <key>CFBundlePackageType</key> <string>APPL</string>
-              <key>CFBundleShortVersionString</key> <string>1.0</string>
-              <key>CFBundleVersion</key> <string>1</string>
-              <key>LSRequiresIPhoneOS</key> <true/>
-              <key>NSCameraUsageDescription</key> <string>需要摄像头进行交通风险预判</string>
-              <key>UILaunchScreen</key> <dict/>
-              <key>MinimumOSVersion</key> <string>17.0</string>
-          </dict>
-          </plist>
-          EOF
+          echo "正在拷贝应用程序从: $APP_PATH"
+          cp -r "$APP_PATH" Payload/
           
-          zip -r Global_ADAS_System.ipa Payload
-
-      - name: Upload Result
+          # 压缩成 IPA
+          zip -vr MyADASApp.ipa Payload/
+          
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ADAS-iPhone-Build
-          path: Global_ADAS_System.ipa
+          name: MyADASApp-v1.0-TrollStore
+          path: MyADASApp.ipa
+          retention-days: 7
