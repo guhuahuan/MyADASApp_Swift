@@ -1,4 +1,4 @@
-name: ADAS-Final-Build-v9
+name: ADAS-Final-Build-v10
 
 on: [push]
 
@@ -13,33 +13,56 @@ jobs:
 
       - name: Prepare Source
         run: |
-          # 1. 隔离模型，防止干扰编译
+          # 1. 物理隔离模型文件，防止 Xcode 自动生成代码导致冲突
           mkdir -p ModelTemp
-          mv Sources/yolov8s.mlpackage ModelTemp/
-          # 2. 清理掉可能冲突的其他 Swift 文件，只保留核心逻辑
+          if [ -d "Sources/yolov8s.mlpackage" ]; then
+            mv Sources/yolov8s.mlpackage ModelTemp/
+          fi
+          
+          # 2. 清理掉可能导致 @main 入口冲突的文件
+          # 我们在 ContentView.swift 里已经写了 @main
           find Sources -name "MyADASApp.swift" -delete
+          
+          # 3. 打印目录结构，方便在日志里排错
+          ls -R Sources/
 
       - name: Build Binary
         run: |
+          # 自动获取工程 Scheme
           SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
+          echo "Building Scheme: $SCHEME_NAME"
+          
+          # 执行归档，禁用代码生成，避免语言检测错误
           xcodebuild archive \
             -scheme "$SCHEME_NAME" \
             -destination 'generic/platform=iOS' \
             -archivePath ./build/MyADAS.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            COREML_CODEGEN_LANGUAGE=None \
             SWIFT_OPTIMIZATION_LEVEL=-Onone
 
       - name: Industrial Manual Packaging
         run: |
+          # 1. 创建标准的 .app 文件夹
           mkdir -p MyADASApp.app
+          
+          # 2. 提取编译好的二进制执行文件
           BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f | grep "bin/" | head -n 1)
+          if [ -z "$BINARY_PATH" ]; then
+            echo "Error: Binary not found!"
+            exit 1
+          fi
           cp "$BINARY_PATH" MyADASApp.app/MyADASApp
           
-          # 编译模型
-          xcrun coremlc compile ModelTemp/yolov8s.mlpackage MyADASApp.app/
+          # 3. 手动编译 YOLO 模型为 iOS 运行时格式 (.mlmodelc)
+          if [ -d "ModelTemp/yolov8s.mlpackage" ]; then
+            xcrun coremlc compile ModelTemp/yolov8s.mlpackage MyADASApp.app/
+          else
+            echo "Warning: yolov8s.mlpackage not found, skipping model compilation."
+          fi
           
-          # 生成 Info.plist
+          # 4. 注入 Info.plist (App 的身份证)
           cat <<EOF > MyADASApp.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -52,12 +75,13 @@ jobs:
               <key>CFBundleShortVersionString</key> <string>1.0</string>
               <key>CFBundleVersion</key> <string>1</string>
               <key>LSRequiresIPhoneOS</key> <true/>
-              <key>NSCameraUsageDescription</key> <string>摄像头用于道路识别</string>
+              <key>NSCameraUsageDescription</key> <string>摄像头用于道路识别与 ADAS 功能测试</string>
               <key>UILaunchScreen</key> <dict/>
           </dict>
           </plist>
           EOF
 
+          # 5. 封装为 IPA 文件
           mkdir -p Payload
           cp -r MyADASApp.app Payload/
           zip -r MyADAS_Final.ipa Payload
