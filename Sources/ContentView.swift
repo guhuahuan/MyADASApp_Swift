@@ -3,22 +3,23 @@ import Vision
 import AVFoundation
 import CoreML
 
-// 1. 数据模型
 struct Detection: Sendable {
     let box: CGRect
     let label: String
 }
 
-// 2. 核心控制器
 @MainActor
 class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detections: [Detection] = []
-    let captureSession = AVCaptureSession()
+    
+    // 使用 nonisolated 让后台线程可以访问，不触发 Actor 报错
+    nonisolated let captureSession: AVCaptureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
-    private var model: VNCoreMLModel?
+    nonisolated private(set) var model: VNCoreMLModel?
 
     override init() {
         super.init()
+        // 在初始化时加载，此时还在主线程环境
         loadModel()
         setupCapture()
     }
@@ -27,7 +28,6 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         do {
             let config = MLModelConfiguration()
             config.computeUnits = .all 
-            // 匹配打包脚本编译出的文件名
             if let modelURL = Bundle.main.url(forResource: "yolov8s", withExtension: "mlmodelc") {
                 let compiledModel = try MLModel(contentsOf: modelURL, configuration: config)
                 self.model = try VNCoreMLModel(for: compiledModel)
@@ -47,30 +47,41 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
         captureSession.commitConfiguration()
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.captureSession.startRunning()
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.captureSession.startRunning()
         }
     }
 
+    // 处理摄像头每一帧的输出
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let request = VNCoreMLRequest(model: model ?? self.fallbackModel()) { [weak self] req, _ in
-            let results = req.results as? [VNRecognizedObjectObservation] ?? []
-            let boxes = results.map { Detection(box: $0.boundingBox, label: $0.labels.first?.identifier ?? "Obj") }
-            Task { @MainActor [weak self] in self?.detections = boxes }
+        
+        // 如果 YOLO 模型加载了就用 YOLO，否则保持空结果
+        let request: VNImageBasedRequest
+        if let visionModel = self.model {
+            request = VNCoreMLRequest(model: visionModel) { [weak self] req, _ in
+                let results = req.results as? [VNRecognizedObjectObservation] ?? []
+                let boxes = results.map { Detection(box: $0.boundingBox, label: $0.labels.first?.identifier ?? "Obj") }
+                Task { @MainActor [weak self] in
+                    self?.detections = boxes
+                }
+            }
+        } else {
+            // 兜底方案：如果模型没加载，使用简单的矩形检测，避免报错
+            request = VNDetectRectanglesRequest { [weak self] req, _ in
+                let results = req.results as? [VNRectangleObservation] ?? []
+                let boxes = results.map { Detection(box: $0.boundingBox, label: "Scanning...") }
+                Task { @MainActor [weak self] in
+                    self?.detections = boxes
+                }
+            }
         }
+        
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         try? handler.perform([request])
     }
-    
-    // 兜底：如果模型没加载好，返回一个空的 Request 以防崩溃
-    private func fallbackModel() -> VNCoreMLModel {
-        // 这里只是为了编译器通过，实际运行会优先加载 YOLO
-        return try! VNCoreMLModel(for: VNDetectFaceRectanglesRequest().model)
-    }
 }
 
-// 3. UI 视图
 struct CameraView: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
@@ -108,7 +119,6 @@ struct ContentView: View {
     }
 }
 
-// 4. 程序入口（把这一段加进去，就不需要其他 .swift 文件了）
 @main
 struct MyADASApp: App {
     var body: some Scene {
