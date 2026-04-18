@@ -1,4 +1,4 @@
-name: ADAS-Manual-Package-v5
+name: ADAS-Final-Build
 
 on: [push]
 
@@ -11,12 +11,12 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      - name: Build and Archive
+      - name: Build Project
         run: |
+          # 自动获取工程名
           SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
-          echo "Detected Scheme: $SCHEME_NAME"
           
-          # 执行归档
+          # 执行归档打包
           xcodebuild archive \
             -scheme "$SCHEME_NAME" \
             -destination 'generic/platform=iOS' \
@@ -26,49 +26,43 @@ jobs:
 
       - name: Industrial Manual Packaging
         run: |
-          # 1. 创建标准的 .app 结构
+          # 1. 创建 App 结构
           mkdir -p MyADASApp.app
           
-          # 2. 从你上次报错的路径里把二进制文件“抠”出来
-          # 路径：build/MyADAS.xcarchive/Products/usr/local/bin/MyADASApp_Swift
+          # 2. 寻找并拷贝二进制执行文件
           BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f | grep "bin/" | head -n 1)
           cp "$BINARY_PATH" MyADASApp.app/MyADASApp
           
-          # 3. 手动生成 Info.plist (这是 App 的“身份证”)
+          # 3. 【关键】在云端编译 YOLO 模型为 iOS 可用的格式
+          # 假设模型就在 Sources 目录下
+          xcrun coremlc compile Sources/yolov8s.mlpackage MyADASApp.app/
+          
+          # 4. 写入 App 身份证 (Info.plist)
           cat <<EOF > MyADASApp.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-              <key>CFBundleExecutable</key>
-              <string>MyADASApp</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.adas.tester</string>
-              <key>CFBundleName</key>
-              <string>MyADAS</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>CFBundleShortVersionString</key>
-              <string>1.0</string>
-              <key>CFBundleVersion</key>
-              <string>1</string>
-              <key>LSRequiresIPhoneOS</key>
-              <true/>
-              <key>NSCameraUsageDescription</key>
-              <string>我们需要使用摄像头来进行道路目标识别</string>
-              <key>UILaunchScreen</key>
-              <dict/>
+              <key>CFBundleExecutable</key> <string>MyADASApp</string>
+              <key>CFBundleIdentifier</key> <string>com.adas.tester</string>
+              <key>CFBundleName</key> <string>MyADAS</string>
+              <key>CFBundlePackageType</key> <string>APPL</string>
+              <key>CFBundleShortVersionString</key> <string>1.0</string>
+              <key>CFBundleVersion</key> <string>1</string>
+              <key>LSRequiresIPhoneOS</key> <true/>
+              <key>NSCameraUsageDescription</key> <string>我们需要使用摄像头来进行道路目标识别</string>
+              <key>UILaunchScreen</key> <dict/>
           </dict>
           </plist>
           EOF
 
-          # 4. 封装成 IPA
+          # 5. 压缩成 IPA
           mkdir -p Payload
           cp -r MyADASApp.app Payload/
-          zip -r MyADAS_Simple.ipa Payload
+          zip -r MyADAS_Final.ipa Payload
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyADAS-Simple-IPA
-          path: MyADAS_Simple.ipa
+          name: MyADAS-Final-IPA
+          path: MyADAS_Final.ipa
