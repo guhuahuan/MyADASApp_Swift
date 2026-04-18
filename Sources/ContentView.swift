@@ -3,7 +3,7 @@ import SwiftUI
 @preconcurrency import AVFoundation
 import CoreML
 
-// 1. 新增：专门用于跨线程传递的原始检测数据结构
+// 1. 保持 Sendable 结构
 struct RawDetection: Sendable {
     let box: CGRect
     let label: String
@@ -23,7 +23,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     
     let captureSession = AVCaptureSession()
     
-    // 依然使用 unsafe 绕过模型本身的 Sendable 检查
+    // 强制关闭模型并发检查
     nonisolated(unsafe) private var internalModel: VNCoreMLModel?
     private let videoDataQueue = DispatchQueue(label: "video_data_queue", qos: .userInitiated)
 
@@ -70,7 +70,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
             guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
             
-            // 2. 修复：映射为 Sendable 的结构体数组，而不是元组数组
+            // 2. 这里的 detections 是在闭包作用域内的局部变量
             let detections = results.map { obs in
                 RawDetection(
                     box: obs.boundingBox,
@@ -78,8 +78,9 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
                 )
             }
             
-            // 3. 此时 detections 是 [RawDetection]，符合 Sendable，跨边界安全
-            Task { @MainActor in
+            // 3. 核心修复：使用 [detections] 捕获列表显式移交所有权
+            // 这告诉编译器：detections 被复制/移进去了，原作用域不再使用它
+            Task { [detections] @MainActor in
                 self?.updateTracking(with: detections)
             }
         }
@@ -87,29 +88,26 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         try? handler.perform([request])
     }
 
-    // 4. 更新参数类型
     private func updateTracking(with newObservations: [RawDetection]) {
         let targetLabels = ["person", "car", "bus", "truck", "motorbike"]
         var totalRisk = 0.0
         
         let updated = newObservations.compactMap { obs -> TrackedObject? in
-            let label = obs.label
-            let box = obs.box
-            
-            guard targetLabels.contains(label) else { return nil }
-            let center = CGPoint(x: box.midX, y: box.midY)
+            guard targetLabels.contains(obs.label) else { return nil }
+            let center = CGPoint(x: obs.box.midX, y: obs.box.midY)
             
             let match = self.trackedObjects.first(where: { 
-                abs($0.currentBox.midX - box.midX) < 0.15 && abs($0.currentBox.midY - box.midY) < 0.15 
+                abs($0.currentBox.midX - obs.box.midX) < 0.15 && abs($0.currentBox.midY - obs.box.midY) < 0.15 
             })
             
             let vel = match != nil ? CGPoint(x: center.x - match!.currentBox.midX, y: center.y - match!.currentBox.midY) : .zero
             
-            if box.midX > 0.3 && box.midX < 0.7 && box.width * box.height > 0.08 {
+            // 简单的碰撞预警逻辑
+            if obs.box.midX > 0.3 && obs.box.midX < 0.7 && obs.box.width * obs.box.height > 0.08 {
                 totalRisk += 0.2
             }
             
-            return TrackedObject(id: match?.id ?? UUID(), label: label, currentBox: box, velocity: vel)
+            return TrackedObject(id: match?.id ?? UUID(), label: obs.label, currentBox: obs.box, velocity: vel)
         }
         
         self.trackedObjects = updated
@@ -117,7 +115,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     }
 }
 
-// 以下预览和 UI 代码保持一致
+// UI 组件
 struct CameraPreviewHolder: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
