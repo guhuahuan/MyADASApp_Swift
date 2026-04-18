@@ -8,11 +8,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      - name: Set up Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: List Schemes (Debug Info)
+        run: xcodebuild -list
+
       - name: Build Unsigned App
         run: |
-          # 针对真机编译，不进行签名
+          # 自动获取第一个可用的 Scheme，避免手动输入错误
+          SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
+          echo "Detected Scheme: $SCHEME_NAME"
+          
+          # 针对真机编译
           xcodebuild build \
-            -scheme MyADASApp \
+            -scheme "$SCHEME_NAME" \
             -destination 'generic/platform=iOS' \
             -configuration Release \
             CODE_SIGNING_ALLOWED=NO \
@@ -23,7 +33,9 @@ jobs:
         run: |
           mkdir -p Payload
           # 寻找生成的 .app 文件夹并放入 Payload
-          cp -r build_output/*.app Payload/
+          # 如果有多个 .app，只取第一个
+          APP_PATH=$(find build_output -name "*.app" -maxdepth 1 | head -n 1)
+          cp -r "$APP_PATH" Payload/
           zip -r MyADAS_Simple.ipa Payload
 
       - name: Upload Artifact
