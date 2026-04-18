@@ -3,34 +3,29 @@ import Vision
 import AVFoundation
 import CoreImage
 
-// MARK: - 追踪对象状态
+// MARK: - 追踪对象模型
 struct TrackedObject: Identifiable {
     let id: UUID
     var label: String
-    var confidence: Float
-    var boundingBox: CGRect
     var distance: Float
-    var lastSeen: Date
+    var boundingBox: CGRect
 }
 
-// MARK: - ADAS 深度进化引擎
 @MainActor
 class ADASUltraViewModel: NSObject, ObservableObject {
     @Published var trackedObjects: [TrackedObject] = []
-    @Published var laneMask: CGImage?
-    @Published var isWarning: Bool = false
+    @Published var roadMask: CGImage?
+    @Published var isCriticalWarning: Bool = false
     
     private let captureSession = AVCaptureSession()
     private let videoDataOutput = AVCaptureVideoDataOutput()
-    private let queue = DispatchQueue(label: "adas.ultra.queue", qos: .userInteractive)
-    
-    // 语音合成器
-    private let speechSynthesizer = AVSpeechSynthesizer()
-    private var lastSpeechDate = Date.distantPast
-    
+    private let queue = DispatchQueue(label: "adas.ultra.processing", qos: .userInteractive)
+    private let context = CIContext()
+    private let synthesizer = AVSpeechSynthesizer()
+    private var lastAlertTime = Date.distantPast
+
     // 线程安全模型容器
     nonisolated(unsafe) private var model: VNCoreMLModel?
-    private let context = CIContext()
 
     override init() {
         super.init()
@@ -39,15 +34,15 @@ class ADASUltraViewModel: NSObject, ObservableObject {
 
     private func setupSystem() {
         Task {
-            // 1. 加载模型
+            // 1. 加载 YOLOv8L
             let config = MLModelConfiguration()
             config.computeUnits = .all
             if let modelURL = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
-               let coreMLModel = try? MLModel(contentsOf: modelURL, configuration: config) {
-                self.model = try? VNCoreMLModel(for: coreMLModel)
+               let coreML = try? MLModel(contentsOf: modelURL, configuration: config) {
+                self.model = try? VNCoreMLModel(for: coreML)
             }
 
-            // 2. 相机配置
+            // 2. 相机输入
             guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
                   let input = try? AVCaptureDeviceInput(device: device) else { return }
             
@@ -55,91 +50,92 @@ class ADASUltraViewModel: NSObject, ObservableObject {
             videoDataOutput.setSampleBufferDelegate(self, queue: queue)
             if captureSession.canAddOutput(videoDataOutput) { captureSession.addOutput(videoDataOutput) }
             
-            captureSession.startRunning()
+            // 3. 启动
+            Task.detached {
+                self.captureSession.startRunning()
+            }
         }
     }
 }
 
-// MARK: - 并发处理逻辑
+// MARK: - 后台推理逻辑 (修复报错点)
 extension ADASUltraViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
         var requests: [VNRequest] = []
 
-        // 功能 3: 语义分割 (可行驶区域)
-        let segmentationRequest = VNDetectGenerateSegmentationRequest(completionHandler: { request, _ in
-            if let observation = request.results?.first as? VNPixelBufferObservation {
-                let mask = observation.pixelBuffer
-                let ciMask = CIImage(cvPixelBuffer: mask)
-                if let cgMask = self.context.createCGImage(ciMask, from: ciMask.extent) {
-                    Task { @MainActor in self.laneMask = cgMask }
-                }
-            }
-        })
-        segmentationRequest.revision = VNDetectGenerateSegmentationRequestRevision1
+        // 修复功能 3: 使用正确的 iOS 17+ 前景分割请求
+        // 这可以识别出路上的车辆和行人，从而构建“占用地图”
+        let segmentationRequest = VNGenerateForegroundInstanceMaskRequest() 
         requests.append(segmentationRequest)
 
-        // 功能 1: YOLO 检测 + 追踪基础
+        // 功能 1: 物体检测
         if let visionModel = self.model {
             let detectionRequest = VNCoreMLRequest(model: visionModel) { request, _ in
                 if let results = request.results as? [VNRecognizedObjectObservation] {
-                    Task { @MainActor in self.processAndTrack(results) }
+                    Task { @MainActor in self.processDetections(results) }
                 }
             }
             detectionRequest.imageCropAndScaleOption = .scaleFill
             requests.append(detectionRequest)
         }
 
-        try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right).perform(requests)
-    }
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
+        try? handler.perform(requests)
 
-    // 功能 1 & 4: 追踪平滑与语音播报逻辑
-    @MainActor
-    private func processAndTrack(_ observations: [VNRecognizedObjectObservation]) {
-        var newTrackedObjects: [TrackedObject] = []
-        var dangerDetected = false
-
-        for obs in observations {
-            // 测距计算 (基于之前讨论的高度公式)
-            let distance = 1.2 / (Float(obs.boundingBox.origin.y) + 0.05)
-            
-            let newObject = TrackedObject(
-                id: UUID(),
-                label: obs.labels.first?.identifier ?? "Unknown",
-                confidence: obs.labels.first?.confidence ?? 0,
-                boundingBox: obs.boundingBox,
-                distance: distance,
-                lastSeen: Date()
-            )
-            newTrackedObjects.append(newObject)
-
-            // 功能 4: 语音逻辑 (3米内报警，且每5秒最多说一次)
-            if distance < 3.0 && (newObject.label == "person" || newObject.label == "car" || newObject.label == "motorcycle") {
-                dangerDetected = true
-                triggerVoiceAlert(label: newObject.label, dist: distance)
+        // 处理分割结果
+        if let maskObservation = segmentationRequest.results?.first {
+            if let maskBuffer = try? maskObservation.generateScaledMaskForCorrespondingRect(
+                from: CGRect(x: 0, y: 0, width: 1, height: 1), 
+                count: 1, 
+                pixelBuffer: pixelBuffer
+            ) {
+                let ciMask = CIImage(cvPixelBuffer: maskBuffer)
+                if let cgMask = self.context.createCGImage(ciMask, from: ciMask.extent) {
+                    Task { @MainActor in self.roadMask = cgMask }
+                }
             }
         }
-        
-        self.trackedObjects = newTrackedObjects
-        self.isWarning = dangerDetected
     }
 
     @MainActor
-    private func triggerVoiceAlert(label: String, dist: Float) {
+    private func processDetections(_ observations: [VNRecognizedObjectObservation]) {
+        var newObjects: [TrackedObject] = []
+        var hasDanger = false
+
+        for obs in observations {
+            let dist = 1.2 / (Float(obs.boundingBox.origin.y) + 0.05)
+            let label = obs.labels.first?.identifier ?? "Target"
+            
+            let obj = TrackedObject(id: UUID(), label: label, distance: dist, boundingBox: obs.boundingBox)
+            newObjects.append(obj)
+
+            // 功能 4: 语音预警逻辑 (距离 < 3米 触发)
+            if dist < 3.0 {
+                hasDanger = true
+                speakAlert(label: label, distance: dist)
+            }
+        }
+        self.trackedObjects = newObjects
+        self.isCriticalWarning = hasDanger
+    }
+
+    @MainActor
+    private func speakAlert(label: String, distance: Float) {
         let now = Date()
-        if now.timeIntervalSince(lastSpeechDate) > 5.0 {
-            let translatedLabel = label == "motorcycle" ? "摩托车" : (label == "car" ? "汽车" : "障碍物")
-            let utterance = AVSpeechUtterance(string: "注意，前方\(Int(dist))米有\(translatedLabel)")
+        if now.timeIntervalSince(lastAlertTime) > 5.0 { // 冷却时间 5 秒，防止轰炸
+            let text = "注意前方 \(Int(distance)) 米 \(label)"
+            let utterance = AVSpeechUtterance(string: text)
             utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
             utterance.rate = 0.55
-            speechSynthesizer.speak(utterance)
-            lastSpeechDate = now
+            synthesizer.speak(utterance)
+            lastAlertTime = now
         }
     }
 }
 
-// MARK: - 特斯拉 SFD 风格 UI
+// MARK: - UI 布局
 struct ContentView: View {
     @StateObject var viewModel = ADASUltraViewModel()
     
@@ -147,66 +143,56 @@ struct ContentView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             
-            // 核心视图：路面分割层 (语义空间)
-            if let mask = viewModel.laneMask {
+            // 1. 语义分割背景层 (路面占用识别)
+            if let mask = viewModel.roadMask {
                 Image(decorative: mask, scale: 1.0)
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundColor(.blue.opacity(0.3)) // 将可行驶区域渲染为淡蓝色
+                    .foregroundColor(.cyan.opacity(0.4))
                     .ignoresSafeArea()
             }
             
-            // 目标追踪层
+            // 2. 追踪框层
             GeometryReader { geo in
                 ForEach(viewModel.trackedObjects) { obj in
                     let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
-                    let color: Color = obj.distance < 4 ? .red : .green
+                    let isClose = obj.distance < 5
                     
                     VStack(alignment: .leading, spacing: 0) {
                         Text("\(obj.label.uppercased()) \(Int(obj.distance))M")
-                            .font(.system(size: 12, weight: .black, design: .monospaced))
-                            .background(color)
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .padding(2)
+                            .background(isClose ? Color.red : Color.green)
                             .foregroundColor(.white)
                         
                         Rectangle()
-                            .stroke(color, lineWidth: 2)
+                            .stroke(isClose ? Color.red : Color.green, lineWidth: 2)
                             .frame(width: rect.width, height: rect.height)
                     }
                     .position(x: rect.midX, y: geo.size.height - rect.midY)
                 }
             }
             
-            // 功能 4: 视觉警告指示器
-            if viewModel.isWarning {
-                Rectangle()
-                    .stroke(Color.red, lineWidth: 10)
-                    .ignoresSafeArea()
-                    .overlay(
-                        Text("COLLISION WARNING")
-                            .font(.system(size: 30, weight: .black))
-                            .foregroundColor(.red)
-                            .padding()
-                            .background(Color.black.opacity(0.7))
-                    )
+            // 3. 碰撞视觉预警
+            if viewModel.isCriticalWarning {
+                Color.red.opacity(0.2).ignoresSafeArea()
+                VStack {
+                    Text("⚠️ 立即减速 ⚠️")
+                        .font(.system(size: 40, weight: .black))
+                        .foregroundColor(.red)
+                        .padding()
+                        .background(Color.white.opacity(0.8))
+                        .cornerRadius(20)
+                }
             }
             
-            // 底部状态栏
+            // 4. 底部状态
             VStack {
                 Spacer()
-                HStack {
-                    VStack(alignment: .leading) {
-                        Text("SYSTEM: YOLOv8L + SEGMENTATION")
-                        Text("TRACKING: ACTIVE")
-                    }
-                    Spacer()
-                    Circle()
-                        .fill(viewModel.isWarning ? Color.red : Color.green)
-                        .frame(width: 12, height: 12)
-                }
-                .font(.system(size: 10, design: .monospaced))
-                .padding()
-                .background(.ultraThinMaterial)
-                .foregroundColor(.white)
+                Text("iPhone 15 ADAS PRO | YOLOv8L + Instance Segmentation")
+                    .font(.caption2.monospaced())
+                    .foregroundColor(.white.opacity(0.6))
+                    .padding(.bottom, 10)
             }
         }
     }
