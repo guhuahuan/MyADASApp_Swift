@@ -3,68 +3,48 @@ name: Build MyADASApp IPA
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-15 # 确保使用 Xcode 16 所在的环境
+    runs-on: macos-14 # 切换到 macos-14，环境更稳，包含完整的 iOS 17 SDK
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Xcode version
-        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
-
       - name: Build Archive
         run: |
-          # 1. 创建编译输出目录
           mkdir -p build
-          
-          # 2. 执行编译。
-          # 核心修复：COREML_CODEGEN_LANGUAGE=Swift 解决模型语言检测问题
-          # 加上 -allowProvisioningUpdates 增加环境适应性
+          # 使用最稳妥的 iOS 17 SDK 进行真机归档
           xcodebuild archive \
             -scheme MyADASApp_Swift \
             -destination "generic/platform=iOS" \
             -archivePath ./build/MyADASApp.xcarchive \
+            -sdk iphoneos \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             COREML_CODEGEN_LANGUAGE=Swift \
-            COMPILER_INDEX_STORE_ENABLE=NO \
             clean
 
       - name: Create IPA (TrollStore Compatible)
         run: |
-          # 检查 Archive 是否真的存在
-          if [ ! -d "./build/MyADASApp.xcarchive" ]; then
-            echo "错误：Archive 文件夹未生成，编译可能已失败！"
-            exit 1
-          fi
-
           mkdir -p Payload
-          
-          # 更加稳健的查找方式：直接去 Products/Applications 目录下找
-          APP_PATH=$(find ./build/MyADASApp.xcarchive/Products/Applications -name "*.app" -type d | head -n 1)
-          
-          if [ -z "$APP_PATH" ]; then
-            echo "错误：在 Archive 内部找不到 .app 文件！"
-            # 列出目录结构方便调试
-            ls -R ./build/MyADASApp.xcarchive
-            exit 1
+          # 检查 Products 目录，这是 Archive 成功的标志
+          if [ -d "./build/MyADASApp.xcarchive/Products/usr/local/bin" ]; then
+            # 针对 SwiftPM 项目的特殊路径处理
+            APP_NAME=$(ls ./build/MyADASApp.xcarchive/Products/usr/local/bin | head -n 1)
+            cp -r "./build/MyADASApp.xcarchive/Products/usr/local/bin/$APP_NAME" Payload/
+          else
+            # 尝试标准路径
+            APP_PATH=$(find ./build/MyADASApp.xcarchive -name "*.app" -type d | head -n 1)
+            cp -r "$APP_PATH" Payload/
           fi
           
-          echo "成功找到应用程序: $APP_PATH"
-          cp -r "$APP_PATH" Payload/
-          
-          # 打包 IPA
           zip -vr MyADASApp.ipa Payload/
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyADASApp-v1.0-TrollStore
+          name: MyADASApp-v1.0
           path: MyADASApp.ipa
-          retention-days: 7
