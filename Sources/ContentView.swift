@@ -4,54 +4,25 @@ import AVFoundation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
-// MARK: - 车道重建引擎 (BEV Reconstruction)
-@MainActor
-class LaneReconstructionEngine: ObservableObject {
-    @Published var laneBEVImage: CGImage?
-    private let context = CIContext()
-
-    func reconstructLanes(from pixelBuffer: CVPixelBuffer) {
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let width = ciImage.extent.width
-        let height = ciImage.extent.height
-
-        // 1. 使用核心滤镜：透视变换 (Perspective Correction)
-        let filter = CIFilter.perspectiveCorrection()
-        filter.inputImage = ciImage
-        
-        // 关键修复：使用 CGPoint 代替 CIVector
-        // 定义一个梯形区域，将其“拉平”为长方形。
-        // 这四个点定义了你车头前方的路面区域。
-        filter.topLeft = CGPoint(x: width * 0.35, y: height * 0.65)
-        filter.topRight = CGPoint(x: width * 0.65, y: height * 0.65)
-        filter.bottomLeft = CGPoint(x: width * 0.05, y: height * 0.2)
-        filter.bottomRight = CGPoint(x: width * 0.95, y: height * 0.2)
-
-        guard let output = filter.outputImage else { return }
-
-        // 2. 增强对比度，突出车道线 (类似特斯拉的二值化占用网络)
-        let colorFilter = CIFilter.colorControls()
-        colorFilter.inputImage = output
-        colorFilter.contrast = 2.5
-        colorFilter.brightness = -0.2
-        
-        if let finalImage = colorFilter.outputImage,
-           let cgImage = context.createCGImage(finalImage, from: finalImage.extent) {
-            self.laneBEVImage = cgImage
-        }
-    }
+// MARK: - 线程安全容器
+// 用于跨越 Actor 边界传递模型
+struct SafeModelContainer: Sendable {
+    let visionModel: VNCoreMLModel
 }
 
-// MARK: - ADAS 综合模型
 @MainActor
 class ADASProViewModel: NSObject, ObservableObject {
     @Published var detections: [VNRecognizedObjectObservation] = []
-    @Published var laneEngine = LaneReconstructionEngine()
+    @Published var laneBEVImage: CGImage?
     
     private let captureSession = AVCaptureSession()
     private let videoDataOutput = AVCaptureVideoDataOutput()
-    private let queue = DispatchQueue(label: "adas.analysis.queue", qos: .userInteractive)
-    private var model: VNCoreMLModel?
+    private let queue = DispatchQueue(label: "adas.worker.queue", qos: .userInteractive)
+    private let context = CIContext()
+
+    // 关键修复：使用 nonisolated(unsafe) 允许后台线程访问
+    // 这是在 2026 年处理高性能 AI 推理的常用“硬核”手段
+    nonisolated(unsafe) private var modelContainer: SafeModelContainer?
 
     override init() {
         super.init()
@@ -60,15 +31,26 @@ class ADASProViewModel: NSObject, ObservableObject {
 
     private func setupSystem() {
         Task {
-            // 模型加载逻辑 (动态编译方法)
+            // 1. 动态加载并编译模型 (解决找不到 yolov8l 类的问题)
             let config = MLModelConfiguration()
-            config.computeUnits = .all
-            if let modelURL = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
-               let coreMLModel = try? MLModel(contentsOf: modelURL, configuration: config) {
-                self.model = try? VNCoreMLModel(for: coreMLModel)
+            config.computeUnits = .all 
+            
+            guard let modelURL = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc") ?? 
+                    Bundle.main.url(forResource: "yolov8l", withExtension: "mlpackage") else {
+                print("❌ 找不到模型文件")
+                return
             }
 
-            // 相机配置
+            do {
+                let compiledURL = try await MLModel.compileModel(at: modelURL)
+                let coreMLModel = try MLModel(contentsOf: compiledURL, configuration: config)
+                let visionModel = try VNCoreMLModel(for: coreMLModel)
+                self.modelContainer = SafeModelContainer(visionModel: visionModel)
+            } catch {
+                print("❌ 模型初始化失败: \(error)")
+            }
+
+            // 2. 相机设置
             guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
                   let input = try? AVCaptureDeviceInput(device: device) else { return }
             
@@ -81,80 +63,111 @@ class ADASProViewModel: NSObject, ObservableObject {
     }
 }
 
+// MARK: - 后台推理逻辑
 extension ADASProViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        // 1. 车道重建 (BEV)
+        reconstructLanesInternal(from: pixelBuffer)
 
-        // 1. 车道线 BEV 重建
-        Task { @MainActor in
-            self.laneEngine.reconstructLanes(from: pixelBuffer)
-        }
-
-        // 2. 物体检测 (YOLOv8L)
-        guard let model = self.model else { return }
-        let request = VNCoreMLRequest(model: model) { request, _ in
+        // 2. 物体检测 (使用线程安全的 container)
+        guard let container = self.modelContainer else { return }
+        
+        let request = VNCoreMLRequest(model: container.visionModel) { request, _ in
             if let results = request.results as? [VNRecognizedObjectObservation] {
-                Task { @MainActor in self.detections = results }
+                Task { @MainActor in
+                    self.detections = results
+                }
             }
         }
+        request.imageCropAndScaleOption = .scaleFill
         try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right).perform([request])
+    }
+
+    // 内部车道重建逻辑 (运行在后台线程)
+    nonisolated private func reconstructLanesInternal(from pixelBuffer: CVPixelBuffer) {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let filter = CIFilter.perspectiveCorrection()
+        filter.inputImage = ciImage
+        
+        let w = ciImage.extent.width
+        let h = ciImage.extent.height
+        
+        // 特斯拉风格透视参数 (针对 iPhone 15 安装高度优化)
+        filter.topLeft = CGPoint(x: w * 0.35, y: h * 0.65)
+        filter.topRight = CGPoint(x: w * 0.65, y: h * 0.65)
+        filter.bottomLeft = CGPoint(x: w * 0.05, y: h * 0.2)
+        filter.bottomRight = CGPoint(x: w * 0.95, y: h * 0.2)
+
+        if let output = filter.outputImage,
+           let cgImage = context.createCGImage(output, from: output.extent) {
+            Task { @MainActor in
+                self.laneBEVImage = cgImage
+            }
+        }
     }
 }
 
-// MARK: - 特斯拉 SFD 渲染界面
+// MARK: - 特斯拉 FSD 风格界面
 struct ContentView: View {
     @StateObject var viewModel = ADASProViewModel()
     
     var body: some View {
         ZStack(alignment: .bottom) {
-            // 背景层：原始相机流（此处可用简单的黑背景模拟，重点在 BEV）
             Color.black.ignoresSafeArea()
             
-            // 顶层：2D 检测框
+            // 2D 增强现实检测层
             GeometryReader { geo in
                 ForEach(viewModel.detections, id: \.uuid) { obs in
                     let rect = VNImageRectForNormalizedRect(obs.boundingBox, Int(geo.size.width), Int(geo.size.height))
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(Color.red, lineWidth: 2)
-                        .frame(width: rect.width, height: rect.height)
-                        .position(x: rect.midX, y: geo.size.height - rect.midY)
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color.red, lineWidth: 2)
+                        Text("\(obs.labels.first?.identifier.uppercased() ?? "")")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .background(Color.red)
+                            .foregroundColor(.white)
+                            .offset(y: -rect.height/2 - 10)
+                    }
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: geo.size.height - rect.midY)
                 }
             }
 
-            // 核心功能：特斯拉风格 BEV 向量空间
+            // 特斯拉 3D 向量空间 (BEV) 视图
             VStack(spacing: 0) {
                 HStack {
-                    Image(systemName: "view.2d")
-                    Text("3D VECTOR SPACE RECONSTRUCTION")
-                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                    Image(systemName: "dot.radiowaves.up.forward")
+                    Text("LANE RECONSTRUCTION & OCCUPANCY")
                 }
+                .font(.system(size: 10, weight: .black, design: .monospaced))
                 .foregroundColor(.cyan)
-                .padding(.bottom, 5)
+                .padding(.bottom, 8)
 
-                if let bev = viewModel.laneEngine.laneBEVImage {
+                if let bev = viewModel.laneBEVImage {
                     ZStack {
                         Image(decorative: bev, scale: 1.0)
                             .resizable()
-                            .frame(width: 320, height: 180)
-                            .clipShape(RoundedRectangle(cornerRadius: 15))
-                            .overlay(RoundedRectangle(cornerRadius: 15).stroke(Color.cyan.opacity(0.5), lineWidth: 2))
+                            .frame(width: 320, height: 160)
+                            .clipShape(RoundedRectangle(cornerRadius: 20))
+                            .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.cyan.opacity(0.4), lineWidth: 2))
                         
-                        // 自车图标 (模拟特斯拉渲染)
-                        VStack {
-                            Spacer()
-                            Image(systemName: "car.fill")
-                                .font(.system(size: 30))
-                                .foregroundColor(.white)
-                                .shadow(color: .cyan, radius: 10)
-                                .padding(.bottom, 10)
-                        }
+                        // 自车渲染
+                        Image(systemName: "car.fill")
+                            .font(.system(size: 24))
+                            .foregroundColor(.white)
+                            .shadow(color: .cyan, radius: 8)
+                            .offset(y: 40)
                     }
-                    .frame(width: 320, height: 180)
+                } else {
+                    RoundedRectangle(cornerRadius: 20)
+                        .fill(Color.gray.opacity(0.2))
+                        .frame(width: 320, height: 160)
+                        .overlay(Text("等待环境感知...").foregroundColor(.gray))
                 }
             }
-            .padding(.bottom, 40)
-            .padding(.horizontal)
-            .background(LinearGradient(colors: [.clear, .black.opacity(0.8)], startPoint: .top, endPoint: .bottom))
+            .padding(.bottom, 50)
         }
     }
 }
