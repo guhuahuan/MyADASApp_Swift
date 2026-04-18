@@ -1,14 +1,14 @@
 import SwiftUI
 import Vision
-@preconcurrency import AVFoundation // 关键 1: 降低旧框架的检查严苛度
+@preconcurrency import AVFoundation
 import CoreML
 
-// 轨迹目标模型
-struct TrackedObject: Identifiable {
+// 1. 定义 Sendable 数据结构，确保跨线程传输安全
+struct TrackedObject: Identifiable, Sendable {
     let id: UUID
-    var label: String
-    var currentBox: CGRect
-    var velocity: CGPoint
+    let label: String
+    let currentBox: CGRect
+    let velocity: CGPoint
 }
 
 @MainActor
@@ -16,11 +16,8 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     @Published var trackedObjects: [TrackedObject] = []
     @Published var alertLevel: Double = 0.0
     
-    // 移除所有 nonisolated 修饰，回归标准 MainActor 隔离
     let captureSession = AVCaptureSession()
     private var internalModel: VNCoreMLModel?
-    
-    // 创建一个专门的后台队列用于处理图像，避免堵塞主线程
     private let videoDataQueue = DispatchQueue(label: "video_data_queue", qos: .userInitiated)
 
     override init() {
@@ -46,44 +43,45 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         captureSession.sessionPreset = .hd1280x720
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device) else { return }
-        
         if captureSession.canAddInput(input) { captureSession.addInput(input) }
-        
         let videoOutput = AVCaptureVideoDataOutput()
-        // 指定在后台队列回调
         videoOutput.setSampleBufferDelegate(self, queue: videoDataQueue)
-        
         if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
         captureSession.commitConfiguration()
         
-        // 关键 2: 既然在主线程启动受阻，我们就在主线程异步任务中启动
         Task {
             self.captureSession.startRunning()
         }
     }
 
-    // 关键 3: 必须显式标记为 nonisolated 以符合协议要求
+    // 关键修正：在 nonisolated 环境下安全处理
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        // 在后台线程同步等待获取模型（避开 Actor 隔离检查）
-        Task { @MainActor in
-            guard let model = self.internalModel else { return }
+        // 步骤 A: 立即在后台执行 Vision 请求，不跨线程传递 pixelBuffer
+        // 我们通过 run 函数在主线程取回模型引用，但这必须极快
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
+        
+        Task {
+            // 在主线程安全获取模型引用
+            guard let model = await MainActor.run(resultType: VNCoreMLModel?.self, {
+                return self.internalModel 
+            }) else { return }
             
-            // 为了性能，我们将 Request 放在后台处理
+            // 步骤 B: 在后台异步执行推理
             let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
                 guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
-                let mapped = results.map { (obs: VNRecognizedObjectObservation) -> (CGRect, String) in
+                
+                // 将结果转为 Sendable 类型 (CGRect, String)
+                let detections = results.map { (obs: VNRecognizedObjectObservation) -> (CGRect, String) in
                     return (obs.boundingBox, obs.labels.first?.identifier ?? "obj")
                 }
                 
-                // 再次回到主线程更新数据
+                // 步骤 C: 只将纯数据传回主线程进行轨迹关联
                 Task { @MainActor in
-                    self?.updateTracking(with: mapped)
+                    self?.updateTracking(with: detections)
                 }
             }
-            
-            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
             try? handler.perform([request])
         }
     }
@@ -96,13 +94,13 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
             guard targetLabels.contains(label) else { return nil }
             let center = CGPoint(x: box.midX, y: box.midY)
             
+            // 轨迹匹配
             let match = self.trackedObjects.first(where: { 
                 abs($0.currentBox.midX - box.midX) < 0.15 && abs($0.currentBox.midY - box.midY) < 0.15 
             })
             
             let vel = match != nil ? CGPoint(x: center.x - match!.currentBox.midX, y: center.y - match!.currentBox.midY) : .zero
             
-            // 危险预判逻辑
             if box.midX > 0.3 && box.midX < 0.7 && box.width * box.height > 0.08 {
                 totalRisk += 0.2
             }
@@ -115,7 +113,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     }
 }
 
-// 预览容器保持一致
+// UI 部分代码保持稳定
 struct CameraPreviewHolder: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
@@ -152,7 +150,7 @@ struct ContentView: View {
                 }
             }
             VStack {
-                Text("TRAFFIC SYSTEM: \(Int(controller.alertLevel * 100))%")
+                Text("GLOBAL ADAS: \(Int(controller.alertLevel * 100))%")
                     .font(.system(.caption, design: .monospaced)).bold()
                     .padding(8).background(controller.alertLevel > 0.5 ? .red : .black.opacity(0.7))
                     .foregroundColor(.white).cornerRadius(8).padding(.top, 50)
