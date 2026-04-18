@@ -1,4 +1,4 @@
-name: ADAS-Final-Build-v11
+name: ADAS-Final-Build-v12
 
 on: [push]
 
@@ -11,48 +11,49 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      # 【核心修复】强制下载 iOS 18 运行时环境，否则无法针对 iOS 目标进行编译
-      - name: Install iOS Platform
-        run: xcodebuild -downloadPlatform iOS
-
       - name: Prepare Source
         run: |
           mkdir -p ModelTemp
           if [ -d "Sources/yolov8s.mlpackage" ]; then
             mv Sources/yolov8s.mlpackage ModelTemp/
           fi
+          # 彻底清除可能存在的 Entitlements 或 App 入口冲突
           find Sources -name "MyADASApp.swift" -delete
           ls -R Sources/
 
       - name: Build Binary
         run: |
+          # 1. 自动寻找 Scheme
           SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
-          echo "Building Scheme: $SCHEME_NAME"
           
-          # 针对 iOS 平台进行 Archive
+          # 2. 【核心改动】显式指定使用 iphoneos SDK，并关闭所有签名验证
           xcodebuild archive \
             -scheme "$SCHEME_NAME" \
+            -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -archivePath ./build/MyADAS.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             COREML_CODEGEN_LANGUAGE=None \
             SWIFT_OPTIMIZATION_LEVEL=-Onone
 
       - name: Industrial Manual Packaging
         run: |
           mkdir -p MyADASApp.app
+          
+          # 提取二进制文件
           BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f | grep "bin/" | head -n 1)
-          if [ -z "$BINARY_PATH" ]; then
-            echo "Error: Binary not found!"
-            exit 1
-          fi
           cp "$BINARY_PATH" MyADASApp.app/MyADASApp
           
+          # 编译模型
           if [ -d "ModelTemp/yolov8s.mlpackage" ]; then
             xcrun coremlc compile ModelTemp/yolov8s.mlpackage MyADASApp.app/
           fi
           
+          # 生成 Info.plist
           cat <<EOF > MyADASApp.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -65,7 +66,7 @@ jobs:
               <key>CFBundleShortVersionString</key> <string>1.0</string>
               <key>CFBundleVersion</key> <string>1</string>
               <key>LSRequiresIPhoneOS</key> <true/>
-              <key>NSCameraUsageDescription</key> <string>摄像头用于道路识别与 ADAS 功能测试</string>
+              <key>NSCameraUsageDescription</key> <string>摄像头用于道路识别</string>
               <key>UILaunchScreen</key> <dict/>
           </dict>
           </plist>
