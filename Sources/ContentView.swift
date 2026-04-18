@@ -1,13 +1,22 @@
-import SwiftUI
-import Vision
+@preconcurrency import SwiftUI
+@preconcurrency import Vision
 import AVFoundation
 import CoreImage
 
-// MARK: - 线程安全容器
-struct SafeModelContainer: Sendable {
+// MARK: - 线程安全容器 (解决 Sendable 报错)
+struct SafeModelContainer: @unchecked Sendable {
     let visionModel: VNCoreMLModel
 }
 
+// MARK: - 追踪对象模型
+struct TrackedObject: Identifiable, Sendable {
+    let id: UUID
+    var label: String
+    var distance: Float
+    var boundingBox: CGRect
+}
+
+// MARK: - ADAS 深度进化引擎
 @MainActor
 class ADASUltraViewModel: NSObject, ObservableObject {
     @Published var trackedObjects: [TrackedObject] = []
@@ -17,11 +26,14 @@ class ADASUltraViewModel: NSObject, ObservableObject {
     private let captureSession = AVCaptureSession()
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private let queue = DispatchQueue(label: "adas.ultra.worker", qos: .userInteractive)
-    private let context = CIContext()
+    
+    // 关键修复：CIContext 不再属于 MainActor，允许后台线程直接使用
+    nonisolated(unsafe) private let context = CIContext()
+    
     private let synthesizer = AVSpeechSynthesizer()
     private var lastAlertTime = Date.distantPast
 
-    // 使用 nonisolated(unsafe) 确保后台线程可以访问模型进行推理
+    // 关键修复：模型容器
     nonisolated(unsafe) private var modelContainer: SafeModelContainer?
 
     override init() {
@@ -31,7 +43,7 @@ class ADASUltraViewModel: NSObject, ObservableObject {
 
     private func setupSystem() {
         Task {
-            // 1. 加载并编译 YOLOv8L
+            // 1. 加载 YOLOv8L
             let config = MLModelConfiguration()
             config.computeUnits = .all
             if let modelURL = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
@@ -40,7 +52,7 @@ class ADASUltraViewModel: NSObject, ObservableObject {
                 self.modelContainer = SafeModelContainer(visionModel: visionModel)
             }
 
-            // 2. 配置相机输入
+            // 2. 配置相机
             guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
                   let input = try? AVCaptureDeviceInput(device: device) else { return }
             
@@ -48,27 +60,25 @@ class ADASUltraViewModel: NSObject, ObservableObject {
             videoDataOutput.setSampleBufferDelegate(self, queue: queue)
             if captureSession.canAddOutput(videoDataOutput) { captureSession.addOutput(videoDataOutput) }
             
-            // 3. 异步启动相机 (解决 Swift 6 警告)
+            // 3. 启动相机 (修复异步调用警告)
             let session = self.captureSession
-            Task.detached {
-                await session.startRunning()
+            DispatchQueue.global(qos: .userInitiated).async {
+                session.startRunning()
             }
         }
     }
 }
 
-// MARK: - 后台处理引擎
+// MARK: - 后台推理引擎
 extension ADASUltraViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        var requests: [VNRequest] = []
-
-        // 功能 3: 实例分割 (用于构建占用网络)
+        let requests: [VNRequest]
+        
+        // 1. 准备请求
         let segmentationRequest = VNGenerateForegroundInstanceMaskRequest()
-        requests.append(segmentationRequest)
-
-        // 功能 1: YOLO 检测
+        
         if let container = self.modelContainer {
             let detectionRequest = VNCoreMLRequest(model: container.visionModel) { request, _ in
                 if let results = request.results as? [VNRecognizedObjectObservation] {
@@ -76,17 +86,20 @@ extension ADASUltraViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
                 }
             }
             detectionRequest.imageCropAndScaleOption = .scaleFill
-            requests.append(detectionRequest)
+            requests = [segmentationRequest, detectionRequest]
+        } else {
+            requests = [segmentationRequest]
         }
 
+        // 2. 执行推理
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         try? handler.perform(requests)
 
-        // 修复功能 3：正确获取分割遮罩
+        // 3. 占用网络提取 (修复 CIContext Actor 隔离报错)
         if let observation = segmentationRequest.results?.first {
-            // 在 iOS 17+ 中，我们直接使用 instanceMask
             let maskBuffer = observation.instanceMask
             let ciMask = CIImage(cvPixelBuffer: maskBuffer)
+            // 在此后台线程使用 context，因为 context 标记为 nonisolated(unsafe)
             if let cgMask = self.context.createCGImage(ciMask, from: ciMask.extent) {
                 Task { @MainActor in
                     self.occupancyMask = cgMask
@@ -101,13 +114,11 @@ extension ADASUltraViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
         var danger = false
 
         for obs in observations {
-            // 简单的几何测距公式
             let dist = 1.2 / (Float(obs.boundingBox.origin.y) + 0.05)
             let label = obs.labels.first?.identifier ?? "Object"
             
             newObjects.append(TrackedObject(id: UUID(), label: label, distance: dist, boundingBox: obs.boundingBox))
 
-            // 功能 4: 语音预警 (3米内且是车/人)
             if dist < 3.0 && (label == "car" || label == "motorcycle" || label == "person") {
                 danger = true
                 triggerVoice(label: label, d: dist)
@@ -120,7 +131,8 @@ extension ADASUltraViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
     @MainActor
     private func triggerVoice(label: String, d: Float) {
         if Date().timeIntervalSince(lastAlertTime) > 5.0 {
-            let msg = "注意，\(Int(d))米内有\(label == "motorcycle" ? "摩托车" : "障碍物")"
+            let labelCN = (label == "motorcycle" ? "摩托车" : (label == "car" ? "汽车" : "行人"))
+            let msg = "注意前方 \(Int(d)) 米有 \(labelCN)"
             let utterance = AVSpeechUtterance(string: msg)
             utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
             utterance.rate = 0.55
@@ -130,32 +142,22 @@ extension ADASUltraViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 }
 
-// MARK: - 模型定义
-struct TrackedObject: Identifiable {
-    let id: UUID
-    var label: String
-    var distance: Float
-    var boundingBox: CGRect
-}
-
-// MARK: - 特斯拉 SFD 风格 UI
-struct ContentView: View {
+// MARK: - 特斯拉风格 UI
+struct ADASView: View {
     @StateObject var viewModel = ADASUltraViewModel()
     
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             
-            // 1. 占用网络 (Occupancy Mask) 渲染层
             if let mask = viewModel.occupancyMask {
                 Image(decorative: mask, scale: 1.0)
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundColor(.cyan.opacity(0.35)) // 用特斯拉标志性的科技蓝表示占用空间
+                    .foregroundColor(.cyan.opacity(0.35))
                     .ignoresSafeArea()
             }
             
-            // 2. 目标检测与距离层
             GeometryReader { geo in
                 ForEach(viewModel.trackedObjects) { obj in
                     let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
@@ -176,7 +178,6 @@ struct ContentView: View {
                 }
             }
             
-            // 3. 碰撞视觉警告
             if viewModel.isCriticalWarning {
                 Color.red.opacity(0.3).ignoresSafeArea()
                 Text("BRAKE")
@@ -184,20 +185,16 @@ struct ContentView: View {
                     .foregroundColor(.white)
                     .italic()
             }
-            
-            // 4. 底部状态仪表
-            VStack {
-                Spacer()
-                HStack {
-                    Text("VISION: YOLOv8L")
-                    Spacer()
-                    Text("SFD: ACTIVE")
-                }
-                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                .foregroundColor(.cyan)
-                .padding()
-                .background(.ultraThinMaterial)
-            }
+        }
+    }
+}
+
+// MARK: - 应用入口 (修复 Linker 错误)
+@main
+struct ADASApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ADASView()
         }
     }
 }
