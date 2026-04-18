@@ -1,4 +1,4 @@
-name: Build MyADASApp IPA (SwiftPM Expert Mode)
+name: Build MyADASApp (iOS 26 Hardcore Mode)
 
 on:
   push:
@@ -16,41 +16,62 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
-      - name: Build with Swift Package Manager
+      - name: Hardcore Compilation
         run: |
-          # 1. 强制使用 Release 配置构建
-          # 2. 指定 triple 确保是 iOS 真机环境
-          swift build -c release --triple arm64-apple-ios17.0
+          # 1. 查找 SDK 路径
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          # 2. 直接调用编译器，强行链接 iOS 标准库
+          # 这样能绕过所有 Project/Scheme 的环境检查
+          swiftc -o MyADASApp_Binary \
+            -target arm64-apple-ios17.0 \
+            -sdk "$SDK_PATH" \
+            Sources/*.swift \
+            -O -whole-module-optimization
 
-      - name: Locate and Package IPA
+      - name: Assemble .app for TrollStore
+        run: |
+          mkdir -p MyADASApp.app
+          
+          # 移动二进制文件并赋予执行权限
+          mv MyADASApp_Binary MyADASApp.app/MyADASApp
+          chmod +x MyADASApp.app/MyADASApp
+          
+          # 创建必要的 Info.plist (TrollStore 需要它来识别入口)
+          cat <<EOF > MyADASApp.app/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>MyADASApp</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.user.MyADASApp</string>
+              <key>CFBundleName</key>
+              <string>MyADASApp</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>MinimumOSVersion</key>
+              <string>17.0</string>
+          </dict>
+          </plist>
+          EOF
+          
+          # 拷贝你的 YOLO 模型
+          cp -r Sources/yolov8s.mlpackage MyADASApp.app/
+
+      - name: Final Zip to IPA
         run: |
           mkdir -p Payload
-          
-          echo "正在从 SwiftPM 产物目录中提取 .app..."
-          # SwiftPM 项目的产物通常在 .build 目录下
-          # 我们直接全盘搜索这个刚生成的二进制包
-          APP_PATH=$(find .build -name "*.app" -type d | head -n 1)
-          
-          # 如果 SwiftPM 没生成 .app，我们手动创建一个壳子（这是给 TrollStore 用的关键技巧）
-          if [ -z "$APP_PATH" ]; then
-            echo "未找到 .app 目录，尝试手动组装包体..."
-            EXECUTABLE_PATH=$(find .build -type f -maxdepth 4 -perm +111 -not -path "*/.*" | head -n 1)
-            
-            mkdir -p MyADASApp.app
-            cp "$EXECUTABLE_PATH" MyADASApp.app/MyADASApp
-            
-            # 拷贝必要的资源文件（模型文件）
-            cp Sources/yolov8s.mlpackage MyADASApp.app/ || true
-            
-            APP_PATH="MyADASApp.app"
-          fi
-          
-          echo "最终打包路径: $APP_PATH"
-          cp -r "$APP_PATH" Payload/
+          cp -r MyADASApp.app Payload/
           zip -vr MyADASApp.ipa Payload/
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyADASApp-iOS26-Final-Ready
+          name: MyADASApp-iOS26-PureBinary
           path: MyADASApp.ipa
