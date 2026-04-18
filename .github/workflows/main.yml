@@ -1,4 +1,4 @@
-name: ADAS-Final-Build-v8
+name: ADAS-Final-Build-v9
 
 on: [push]
 
@@ -11,11 +11,13 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      - name: Pre-build Clean
+      - name: Prepare Source
         run: |
-          # 将模型暂时移出 Sources 目录，防止 Xcode 自动生成代码报错
+          # 1. 隔离模型，防止干扰编译
           mkdir -p ModelTemp
           mv Sources/yolov8s.mlpackage ModelTemp/
+          # 2. 清理掉可能冲突的其他 Swift 文件，只保留核心逻辑
+          find Sources -name "MyADASApp.swift" -delete
 
       - name: Build Binary
         run: |
@@ -25,7 +27,8 @@ jobs:
             -destination 'generic/platform=iOS' \
             -archivePath ./build/MyADAS.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_REQUIRED=NO \
+            SWIFT_OPTIMIZATION_LEVEL=-Onone
 
       - name: Industrial Manual Packaging
         run: |
@@ -33,7 +36,7 @@ jobs:
           BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f | grep "bin/" | head -n 1)
           cp "$BINARY_PATH" MyADASApp.app/MyADASApp
           
-          # 手动编译之前移走的模型
+          # 编译模型
           xcrun coremlc compile ModelTemp/yolov8s.mlpackage MyADASApp.app/
           
           # 生成 Info.plist
@@ -49,7 +52,7 @@ jobs:
               <key>CFBundleShortVersionString</key> <string>1.0</string>
               <key>CFBundleVersion</key> <string>1</string>
               <key>LSRequiresIPhoneOS</key> <true/>
-              <key>NSCameraUsageDescription</key> <string>我们需要使用摄像头来进行道路目标识别</string>
+              <key>NSCameraUsageDescription</key> <string>摄像头用于道路识别</string>
               <key>UILaunchScreen</key> <dict/>
           </dict>
           </plist>
