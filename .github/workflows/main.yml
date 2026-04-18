@@ -1,22 +1,33 @@
-name: iOS Build Test
+name: ADAS-Simple-Build
 
-on:
-  push:
-    branches: [ "main" ]
+on: [push]
 
 jobs:
   build:
-    runs-on: macos-15
-
+    runs-on: macos-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Build for Simulator
+      - uses: actions/checkout@v4
+      
+      - name: Build Unsigned App
         run: |
-          # 使用通用的 iOS Simulator 占位符
+          # 针对真机编译，不进行签名
           xcodebuild build \
-            -scheme MyADASApp_Swift \
-            -destination "generic/platform=iOS Simulator" \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO
+            -scheme MyADASApp \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CONFIGURATION_BUILD_DIR=build_output
+
+      - name: Create IPA Container
+        run: |
+          mkdir -p Payload
+          # 寻找生成的 .app 文件夹并放入 Payload
+          cp -r build_output/*.app Payload/
+          zip -r MyADAS_Simple.ipa Payload
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyADAS-Simple-IPA
+          path: MyADAS_Simple.ipa
