@@ -1,4 +1,4 @@
-name: Build MyADASApp IPA (Direct Extraction)
+name: Build MyADASApp IPA (Ultimate Recovery)
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15 # 必须用 15 来支持你的 Swift 6 代码
+    runs-on: macos-15
     
     steps:
       - name: Checkout repository
@@ -16,9 +16,9 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
-      - name: Force Build (Skip Archive)
+      - name: Build Project
         run: |
-          # 这一步只编译，不进行严格的 Archive 归档，从而避开 SDK 18 的缺失检查
+          # 强制清理并编译，不进行签名验证
           xcodebuild build \
             -scheme MyADASApp_Swift \
             -destination "generic/platform=iOS" \
@@ -26,28 +26,30 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             COREML_CODEGEN_LANGUAGE=Swift \
-            COMPILER_INDEX_STORE_ENABLE=NO
+            clean
 
-      - name: Package to IPA
+      - name: Locate and Package IPA
         run: |
           mkdir -p Payload
           
-          # 直接进入编译缓存目录把生成的包拎出来
-          APP_PATH=$(find ./DerivedData -name "*.app" -type d | grep "Release-iphoneos" | head -n 1)
+          echo "开始全盘搜索 .app 编译产物..."
+          # 核心修复：不带路径前缀，搜索所有编译出的 .app 文件夹
+          APP_PATH=$(find ./DerivedData -name "*.app" -type d -not -path "*.xcarchive*" | head -n 1)
           
           if [ -z "$APP_PATH" ]; then
-            echo "错误：编译产物中找不到 .app 文件！"
-            # 最后的倔强：列出所有文件看看编译器到底把包塞哪了
-            find ./DerivedData -name "*.app" -type d
+            echo "错误：全盘搜索依然找不到 .app！以下是目录结构，请检查："
+            find ./DerivedData -maxdepth 4
             exit 1
           fi
           
-          echo "捕获到编译产物: $APP_PATH"
+          echo "成功捕获产物：$APP_PATH"
           cp -r "$APP_PATH" Payload/
+          
+          # 创建 IPA
           zip -vr MyADASApp.ipa Payload/
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyADASApp-v1.0-FastBuild
+          name: MyADASApp-iOS26-Final
           path: MyADASApp.ipa
