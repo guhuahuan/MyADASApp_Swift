@@ -1,9 +1,14 @@
 import SwiftUI
-@preconcurrency import Vision // 修复 1: 弱化 Vision 框架的并发检查
+@preconcurrency import Vision
 @preconcurrency import AVFoundation
 import CoreML
 
-// 轨迹目标模型
+// 1. 新增：专门用于跨线程传递的原始检测数据结构
+struct RawDetection: Sendable {
+    let box: CGRect
+    let label: String
+}
+
 struct TrackedObject: Identifiable, Sendable {
     let id: UUID
     let label: String
@@ -18,10 +23,8 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     
     let captureSession = AVCaptureSession()
     
-    // 修复 2: 使用 nonisolated(unsafe) 告诉编译器：
-    // “我担保这个模型在多线程下是安全的，请停止 Sendable 检查。”
+    // 依然使用 unsafe 绕过模型本身的 Sendable 检查
     nonisolated(unsafe) private var internalModel: VNCoreMLModel?
-    
     private let videoDataQueue = DispatchQueue(label: "video_data_queue", qos: .userInitiated)
 
     override init() {
@@ -58,22 +61,24 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         }
     }
 
-    // 修复 3: 由于使用了 unsafe 标记，现在可以直接在 nonisolated 回调中同步访问 model
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let model = self.internalModel else { return }
         
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         
-        // 直接在此处创建 Request，无需 Task 跨线程，避免 pixelBuffer 传递报错
         let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
             guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
             
-            let detections = results.map { (obs: VNRecognizedObjectObservation) -> (CGRect, String) in
-                return (obs.boundingBox, obs.labels.first?.identifier ?? "obj")
+            // 2. 修复：映射为 Sendable 的结构体数组，而不是元组数组
+            let detections = results.map { obs in
+                RawDetection(
+                    box: obs.boundingBox,
+                    label: obs.labels.first?.identifier ?? "obj"
+                )
             }
             
-            // 只有最后的结果（纯数据）才切回主线程
+            // 3. 此时 detections 是 [RawDetection]，符合 Sendable，跨边界安全
             Task { @MainActor in
                 self?.updateTracking(with: detections)
             }
@@ -82,11 +87,15 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         try? handler.perform([request])
     }
 
-    private func updateTracking(with newObservations: [(CGRect, String)]) {
+    // 4. 更新参数类型
+    private func updateTracking(with newObservations: [RawDetection]) {
         let targetLabels = ["person", "car", "bus", "truck", "motorbike"]
         var totalRisk = 0.0
         
-        let updated = newObservations.compactMap { (box, label) -> TrackedObject? in
+        let updated = newObservations.compactMap { obs -> TrackedObject? in
+            let label = obs.label
+            let box = obs.box
+            
             guard targetLabels.contains(label) else { return nil }
             let center = CGPoint(x: box.midX, y: box.midY)
             
@@ -108,7 +117,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     }
 }
 
-// UI 预览保持不变
+// 以下预览和 UI 代码保持一致
 struct CameraPreviewHolder: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
@@ -145,7 +154,7 @@ struct ContentView: View {
                 }
             }
             VStack {
-                Text("GLOBAL ADAS: \(Int(controller.alertLevel * 100))%")
+                Text("ADAS ACTIVE - VIETNAM MODE")
                     .font(.system(.caption, design: .monospaced)).bold()
                     .padding(8).background(controller.alertLevel > 0.5 ? .red : .black.opacity(0.7))
                     .foregroundColor(.white).cornerRadius(8).padding(.top, 50)
