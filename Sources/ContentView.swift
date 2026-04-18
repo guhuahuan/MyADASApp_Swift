@@ -1,8 +1,9 @@
 import SwiftUI
-import Vision
+@preconcurrency import Vision // 修复 1: 弱化 Vision 框架的并发检查
 @preconcurrency import AVFoundation
 import CoreML
 
+// 轨迹目标模型
 struct TrackedObject: Identifiable, Sendable {
     let id: UUID
     let label: String
@@ -16,7 +17,11 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     @Published var alertLevel: Double = 0.0
     
     let captureSession = AVCaptureSession()
-    private var internalModel: VNCoreMLModel?
+    
+    // 修复 2: 使用 nonisolated(unsafe) 告诉编译器：
+    // “我担保这个模型在多线程下是安全的，请停止 Sendable 检查。”
+    nonisolated(unsafe) private var internalModel: VNCoreMLModel?
+    
     private let videoDataQueue = DispatchQueue(label: "video_data_queue", qos: .userInitiated)
 
     override init() {
@@ -53,27 +58,28 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
         }
     }
 
+    // 修复 3: 由于使用了 unsafe 标记，现在可以直接在 nonisolated 回调中同步访问 model
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+              let model = self.internalModel else { return }
+        
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         
-        Task {
-            // 关键修复：使用最简洁的闭包语法，Swift 会自动推断返回类型
-            guard let model = await MainActor.run(body: { self.internalModel }) else { return }
+        // 直接在此处创建 Request，无需 Task 跨线程，避免 pixelBuffer 传递报错
+        let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
+            guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
             
-            let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
-                guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
-                
-                let detections = results.map { (obs: VNRecognizedObjectObservation) -> (CGRect, String) in
-                    return (obs.boundingBox, obs.labels.first?.identifier ?? "obj")
-                }
-                
-                Task { @MainActor in
-                    self?.updateTracking(with: detections)
-                }
+            let detections = results.map { (obs: VNRecognizedObjectObservation) -> (CGRect, String) in
+                return (obs.boundingBox, obs.labels.first?.identifier ?? "obj")
             }
-            try? handler.perform([request])
+            
+            // 只有最后的结果（纯数据）才切回主线程
+            Task { @MainActor in
+                self?.updateTracking(with: detections)
+            }
         }
+        
+        try? handler.perform([request])
     }
 
     private func updateTracking(with newObservations: [(CGRect, String)]) {
@@ -102,6 +108,7 @@ class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOut
     }
 }
 
+// UI 预览保持不变
 struct CameraPreviewHolder: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
