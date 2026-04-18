@@ -1,172 +1,171 @@
 import SwiftUI
-@preconcurrency import Vision
-@preconcurrency import AVFoundation
-import CoreML
+import Vision
+import AVFoundation
 
-// 1. 显式标记为 Sendable，解决跨线程数据竞争的核心结构
-struct RawDetection: Sendable {
-    let box: CGRect
-    let label: String
-}
-
-struct TrackedObject: Identifiable, Sendable {
-    let id: UUID
-    let label: String
-    let currentBox: CGRect
-    let velocity: CGPoint
-}
-
+// MARK: - ADAS 核心逻辑控制器
 @MainActor
-class GlobalTrafficController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    @Published var trackedObjects: [TrackedObject] = []
-    @Published var alertLevel: Double = 0.0
+class ADASViewModel: NSObject, ObservableObject {
+    @Published var detectedObjects: [VNRecognizedObjectObservation] = []
+    @Published var isModelLoading = true
     
-    let captureSession = AVCaptureSession()
+    private var captureSession = AVCaptureSession()
+    private var videoDeviceInput: AVCaptureDeviceInput?
+    private let videoDataOutput = AVCaptureVideoDataOutput()
+    private let videoDataOutputQueue = DispatchQueue(label: "com.user.adas.video-queue", qos: .userInteractive)
     
-    // 强制关闭模型并发检查：模型是只读的，由我们手动担保安全
-    nonisolated(unsafe) private var internalModel: VNCoreMLModel?
-    private let videoDataQueue = DispatchQueue(label: "video_data_queue", qos: .userInitiated)
+    private var model: VNCoreMLModel?
 
     override init() {
         super.init()
-        loadModel()
-        setupCapture()
-    }
-
-    private func loadModel() {
-        guard let modelURL = Bundle.main.url(forResource: "yolov8s", withExtension: "mlmodelc") else { return }
-        do {
-            let config = MLModelConfiguration()
-            config.computeUnits = .all
-            let m = try MLModel(contentsOf: modelURL, configuration: config)
-            self.internalModel = try VNCoreMLModel(for: m)
-        } catch {
-            print("Model load failed")
-        }
-    }
-
-    func setupCapture() {
-        captureSession.beginConfiguration()
-        captureSession.sessionPreset = .hd1280x720
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: device) else { return }
-        if captureSession.canAddInput(input) { captureSession.addInput(input) }
-        let videoOutput = AVCaptureVideoDataOutput()
-        videoOutput.setSampleBufferDelegate(self, queue: videoDataQueue)
-        if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
-        captureSession.commitConfiguration()
-        
         Task {
-            self.captureSession.startRunning()
+            await setupModel()
+            setupCamera()
         }
     }
-
-    // 关键：nonisolated 回调，避免主线程阻塞
-    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let model = self.internalModel else { return }
-        
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
-        
-        let request = VNCoreMLRequest(model: model) { req, _ in
-            guard let results = req.results as? [VNRecognizedObjectObservation] else { return }
+    
+    // 加载刚刚上传的 yolov8l 模型
+    private func setupModel() async {
+        do {
+            // 注意：确保项目中模型文件名完全匹配 yolov8l
+            let config = MLModelConfiguration()
+            config.computeUnits = .all // 强制开启 Neural Engine (ANE)
             
-            // 提取数据
-            let detections = results.map { obs in
-                RawDetection(
-                    box: obs.boundingBox,
-                    label: obs.labels.first?.identifier ?? "obj"
-                )
-            }
+            let coreMLModel = try yolov8l(configuration: config).model
+            let visionModel = try VNCoreMLModel(for: coreMLModel)
             
-            // 核心修复：通过 Task 捕获 Sendable 数据，并异步切回主线程执行 UI 更新
-            Task { [weak self, detections] in
-                await self?.updateTracking(with: detections)
-            }
+            self.model = visionModel
+            self.isModelLoading = false
+        } catch {
+            print("模型加载失败: \(error)")
         }
-        
-        try? handler.perform([request])
     }
-
-    // 控制器本身是 @MainActor，所以这个方法必须在主线程执行
-    private func updateTracking(with newObservations: [RawDetection]) {
-        let targetLabels = ["person", "car", "bus", "truck", "motorbike"]
-        var totalRisk = 0.0
+    
+    private func setupCamera() {
+        captureSession.beginConfiguration()
         
-        let updated = newObservations.compactMap { obs -> TrackedObject? in
-            guard targetLabels.contains(obs.label) else { return nil }
-            let center = CGPoint(x: obs.box.midX, y: obs.box.midY)
-            
-            let match = self.trackedObjects.first(where: { 
-                abs($0.currentBox.midX - obs.box.midX) < 0.15 && abs($0.currentBox.midY - obs.box.midY) < 0.15 
-            })
-            
-            let vel = match != nil ? CGPoint(x: center.x - match!.currentBox.midX, y: center.y - match!.currentBox.midY) : .zero
-            
-            // 针对越南高密度路况的简易碰撞模型
-            if obs.box.midX > 0.3 && obs.box.midX < 0.7 && obs.box.width * obs.box.height > 0.08 {
-                totalRisk += 0.2
+        // 获取后置摄像头
+        guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
+        
+        do {
+            let videoDeviceInput = try AVCaptureDeviceInput(device: videoDevice)
+            if captureSession.canAddInput(videoDeviceInput) {
+                captureSession.addInput(videoDeviceInput)
             }
             
-            return TrackedObject(id: match?.id ?? UUID(), label: obs.label, currentBox: obs.box, velocity: vel)
+            if captureSession.canAddOutput(videoDataOutput) {
+                captureSession.addOutput(videoDataOutput)
+                videoDataOutput.alwaysDiscardsLateVideoFrames = true
+                videoDataOutput.setSampleBufferDelegate(self, queue: videoDataOutputQueue)
+            }
+            
+            // 针对 2026 年的高清屏幕优化分辨率
+            captureSession.sessionPreset = .hd1920x1080
+            captureSession.commitConfiguration()
+            
+            Task.detached {
+                self.captureSession.startRunning()
+            }
+        } catch {
+            print("相机设置失败: \(error)")
         }
-        
-        self.trackedObjects = updated
-        self.alertLevel = min(totalRisk, 1.0)
     }
 }
 
-// MARK: - UI 视图
-struct CameraPreviewHolder: UIViewRepresentable {
-    let session: AVCaptureSession
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView(frame: UIScreen.main.bounds)
-        let layer = AVCaptureVideoPreviewLayer(session: session)
-        layer.frame = view.layer.bounds
-        layer.videoGravity = .resizeAspectFill
-        view.layer.addSublayer(layer)
-        return view
-    }
-    func updateUIView(_ uiView: UIView, context: Context) {}
-}
-
-struct ContentView: View {
-    @StateObject var controller = GlobalTrafficController()
-    var body: some View {
-        ZStack {
-            CameraPreviewHolder(session: controller.captureSession).ignoresSafeArea()
-            Canvas { context, size in
-                for obj in controller.trackedObjects {
-                    let rect = CGRect(
-                        x: obj.currentBox.minX * size.width,
-                        y: (1 - obj.currentBox.maxY) * size.height,
-                        width: obj.currentBox.width * size.width,
-                        height: obj.currentBox.height * size.height
-                    )
-                    let color: Color = controller.alertLevel > 0.5 ? .red : .green
-                    context.stroke(Path(rect), with: .color(color), lineWidth: 2)
-                    
-                    // 速度矢量线
-                    var line = Path()
-                    line.move(to: CGPoint(x: rect.midX, y: rect.midY))
-                    line.addLine(to: CGPoint(x: rect.midX + obj.velocity.x * size.width * 10, y: rect.midY - obj.velocity.y * size.height * 10))
-                    context.stroke(line, with: .color(color.opacity(0.6)), style: StrokeStyle(lineWidth: 1, dash: [5]))
+// MARK: - 实时推理委托
+extension ADASViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let model = model, !isModelLoading else { return }
+        
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        let request = VNCoreMLRequest(model: model) { request, error in
+            if let results = request.results as? [VNRecognizedObjectObservation] {
+                DispatchQueue.main.async {
+                    self.detectedObjects = results
                 }
             }
-            VStack {
-                Text("ADAS ACTIVE - VIETNAM MODE")
-                    .font(.system(.caption, design: .monospaced)).bold()
-                    .padding(8).background(controller.alertLevel > 0.5 ? .red : .black.opacity(0.7))
-                    .foregroundColor(.white).cornerRadius(8).padding(.top, 50)
-                Spacer()
-            }
+        }
+        
+        // 保持推理方向与手机竖屏一致
+        request.imageCropAndScaleOption = .scaleFill
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+        
+        do {
+            try handler.perform([request])
+        } catch {
+            print("推理失败: \(error)")
         }
     }
 }
 
+// MARK: - UI 界面
+struct ContentView: View {
+    @StateObject private var viewModel = ADASViewModel()
+    
+    var body: some View {
+        ZStack {
+            // 相机预览层（此处建议在实际工程中嵌入 UIViewRepresentable 的预览层）
+            Color.black.ignoresSafeArea()
+            
+            if viewModel.isModelLoading {
+                VStack {
+                    ProgressView()
+                        .tint(.white)
+                    Text("正在加载 YOLOv8L 引擎...")
+                        .foregroundColor(.white)
+                        .padding()
+                }
+            } else {
+                // 绘制检测框
+                GeometryReader { geometry in
+                    ForEach(viewModel.detectedObjects, id: \.uuid) { obj in
+                        let box = obj.boundingBox
+                        let width = box.width * geometry.size.width
+                        let height = box.height * geometry.size.height
+                        let x = box.origin.x * geometry.size.width
+                        let y = (1 - box.origin.y - box.height) * geometry.size.height
+                        
+                        Rectangle()
+                            .path(in: CGRect(x: x, y: y, width: width, height: height))
+                            .stroke(Color.green, lineWidth: 2)
+                        
+                        if let label = obj.labels.first {
+                            Text("\(label.identifier) \(Int(label.confidence * 100))%")
+                                .position(x: x + width/2, y: y - 10)
+                                .foregroundColor(.green)
+                                .font(.caption.bold())
+                        }
+                    }
+                }
+                
+                // 状态指示器
+                VStack {
+                    HStack {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 10, height: 10)
+                        Text("iOS 26 ADAS 实时监控 (YOLOv8L)")
+                            .font(.system(size: 12, weight: .black, design: .monospaced))
+                            .foregroundColor(.white)
+                    }
+                    .padding(8)
+                    .background(Color.black.opacity(0.7))
+                    .cornerRadius(8)
+                    .padding(.top, 50)
+                    Spacer()
+                }
+            }
+        }
+        .statusBarHidden()
+    }
+}
+
+// MARK: - 程序入口
 @main
 struct MyADASApp: App {
     var body: some Scene {
-        WindowGroup { ContentView() }
+        WindowGroup {
+            ContentView()
+        }
     }
 }
