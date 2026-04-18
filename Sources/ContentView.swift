@@ -4,126 +4,162 @@ import AVFoundation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
-// MARK: - 车道重建与渲染引擎
+// MARK: - 车道重建引擎 (BEV Reconstruction)
 @MainActor
 class LaneReconstructionEngine: ObservableObject {
-    @Published var laneBEVImage: CGImage? // 鸟瞰图车道
-    
+    @Published var laneBEVImage: CGImage?
     private let context = CIContext()
-    
-    // 将相机画面转换为鸟瞰图，并提取车道
+
     func reconstructLanes(from pixelBuffer: CVPixelBuffer) {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        
-        // 1. 动态生成可行驶区域分割图 (利用 iOS 26 新版 Vision)
-        // (这里为了代码简洁，使用 CI 滤镜模拟道路灰度提取，实际应调用语义分割请求)
-        let roadFilter = CIFilter.colorThreshold()
-        roadFilter.inputImage = ciImage
-        roadFilter.threshold = 0.3 // 假设柏油路灰度
-        guard let roadMask = roadFilter.outputImage else { return }
-        
-        // 2. 执行透视变换 (Perspective Transform / Homography)
-        // 将梯形的道路区域拉伸为长方形的鸟瞰图
-        let perspectiveTransform = CIFilter.perspectiveTransform()
-        perspectiveTransform.inputImage = roadMask
-        
-        // 定义原图中的梯形顶点 (根据 iPhone 15 安装高度调整)
         let width = ciImage.extent.width
         let height = ciImage.extent.height
-        perspectiveTransform.topLeft = CIVector(x: width * 0.4, y: height * 0.6)
-        perspectiveTransform.topRight = CIVector(x: width * 0.6, y: height * 0.6)
-        perspectiveTransform.bottomLeft = CIVector(x: 0, y: height * 0.1)
-        perspectiveTransform.bottomRight = CIVector(x: width, y: height * 0.1)
+
+        // 1. 使用核心滤镜：透视变换 (Perspective Correction)
+        let filter = CIFilter.perspectiveCorrection()
+        filter.inputImage = ciImage
         
-        guard let bevOutput = perspectiveTransform.outputImage else { return }
+        // 关键修复：使用 CGPoint 代替 CIVector
+        // 定义一个梯形区域，将其“拉平”为长方形。
+        // 这四个点定义了你车头前方的路面区域。
+        filter.topLeft = CGPoint(x: width * 0.35, y: height * 0.65)
+        filter.topRight = CGPoint(x: width * 0.65, y: height * 0.65)
+        filter.bottomLeft = CGPoint(x: width * 0.05, y: height * 0.2)
+        filter.bottomRight = CGPoint(x: width * 0.95, y: height * 0.2)
+
+        guard let output = filter.outputImage else { return }
+
+        // 2. 增强对比度，突出车道线 (类似特斯拉的二值化占用网络)
+        let colorFilter = CIFilter.colorControls()
+        colorFilter.inputImage = output
+        colorFilter.contrast = 2.5
+        colorFilter.brightness = -0.2
         
-        // 3. 渲染为 CGImage 用于 SwiftUI 显示
-        if let cgImage = context.createCGImage(bevOutput, from: bevOutput.extent) {
+        if let finalImage = colorFilter.outputImage,
+           let cgImage = context.createCGImage(finalImage, from: finalImage.extent) {
             self.laneBEVImage = cgImage
         }
     }
 }
 
+// MARK: - ADAS 综合模型
 @MainActor
-class ADASProViewModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    @Published var detections: [(observation: VNRecognizedObjectObservation, distance: Float)] = []
+class ADASProViewModel: NSObject, ObservableObject {
+    @Published var detections: [VNRecognizedObjectObservation] = []
+    @Published var laneEngine = LaneReconstructionEngine()
     
     private let captureSession = AVCaptureSession()
+    private let videoDataOutput = AVCaptureVideoDataOutput()
+    private let queue = DispatchQueue(label: "adas.analysis.queue", qos: .userInteractive)
     private var model: VNCoreMLModel?
-    private let queue = DispatchQueue(label: "video-processing", qos: .userInteractive)
-    
-    // 引入车道引擎
-    @ObservedObject var laneEngine = LaneReconstructionEngine()
 
     override init() {
         super.init()
-        setupEngine()
+        setupSystem()
     }
 
-    private func setupEngine() {
+    private func setupSystem() {
         Task {
-            // 模型和相机配置省略... (参考前一版代码)
-            await captureSession.startRunning()
-        }
-    }
+            // 模型加载逻辑 (动态编译方法)
+            let config = MLModelConfiguration()
+            config.computeUnits = .all
+            if let modelURL = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
+               let coreMLModel = try? MLModel(contentsOf: modelURL, configuration: config) {
+                self.model = try? VNCoreMLModel(for: coreMLModel)
+            }
 
-    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        
-        // 核心功能 1：YOLO 物体检测
-        // (检测代码省略...)
-        
-        // 核心功能 2：实时车道重建
-        Task { @MainActor in
-            self.laneEngine.reconstructLanes(from: pixelBuffer)
+            // 相机配置
+            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                  let input = try? AVCaptureDeviceInput(device: device) else { return }
+            
+            if captureSession.canAddInput(input) { captureSession.addInput(input) }
+            videoDataOutput.setSampleBufferDelegate(self, queue: queue)
+            if captureSession.canAddOutput(videoDataOutput) { captureSession.addOutput(videoDataOutput) }
+            
+            captureSession.startRunning() 
         }
     }
 }
 
-// MARK: - 特斯拉风仪表盘界面
+extension ADASProViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
+    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // 1. 车道线 BEV 重建
+        Task { @MainActor in
+            self.laneEngine.reconstructLanes(from: pixelBuffer)
+        }
+
+        // 2. 物体检测 (YOLOv8L)
+        guard let model = self.model else { return }
+        let request = VNCoreMLRequest(model: model) { request, _ in
+            if let results = request.results as? [VNRecognizedObjectObservation] {
+                Task { @MainActor in self.detections = results }
+            }
+        }
+        try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right).perform([request])
+    }
+}
+
+// MARK: - 特斯拉 SFD 渲染界面
 struct ContentView: View {
     @StateObject var viewModel = ADASProViewModel()
     
     var body: some View {
         ZStack(alignment: .bottom) {
-            // 1. 全屏相机背景 + YOLO 检测框 (参考前一版代码)
-            Color.black.ignoresSafeArea() 
+            // 背景层：原始相机流（此处可用简单的黑背景模拟，重点在 BEV）
+            Color.black.ignoresSafeArea()
             
-            // 2. 底部车道渲染窗口 (BEV Bird's Eye View)
-            VStack {
-                HStack {
-                    Image(systemName: "car.top.radiowaves.rear.left.and.rear.right")
-                    Text("VECTOR SPACE | LANE RECONSTRUCTION")
-                }
-                .font(.system(size: 10, weight: .black, design: .monospaced))
-                .foregroundColor(.white)
-                .padding(.top, 8)
-                
-                if let bevImage = viewModel.laneEngine.laneBEVImage {
-                    Image(decorative: bevImage, scale: 1.0)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .overlay {
-                            // 绘制自车（上帝视角中心）
-                            Rectangle()
-                                .fill(Color.blue)
-                                .frame(width: 30, height: 50)
-                                .cornerRadius(4)
-                                .offset(y: 40) // 位于 BEV 图底部中心
-                        }
-                        .frame(width: 300, height: 150)
-                        .background(Color.black)
-                        .cornerRadius(12)
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.3), lineWidth: 1))
-                        .padding(.bottom, 30)
-                } else {
-                    ProgressView("计算车道中...").tint(.white).frame(width: 300, height: 150)
+            // 顶层：2D 检测框
+            GeometryReader { geo in
+                ForEach(viewModel.detections, id: \.uuid) { obs in
+                    let rect = VNImageRectForNormalizedRect(obs.boundingBox, Int(geo.size.width), Int(geo.size.height))
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(Color.red, lineWidth: 2)
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: geo.size.height - rect.midY)
                 }
             }
-            .background(Color.black.opacity(0.8))
-            .cornerRadius(16)
-            .padding(.horizontal, 20)
-            .padding(.bottom, 20)
+
+            // 核心功能：特斯拉风格 BEV 向量空间
+            VStack(spacing: 0) {
+                HStack {
+                    Image(systemName: "view.2d")
+                    Text("3D VECTOR SPACE RECONSTRUCTION")
+                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                }
+                .foregroundColor(.cyan)
+                .padding(.bottom, 5)
+
+                if let bev = viewModel.laneEngine.laneBEVImage {
+                    ZStack {
+                        Image(decorative: bev, scale: 1.0)
+                            .resizable()
+                            .frame(width: 320, height: 180)
+                            .clipShape(RoundedRectangle(cornerRadius: 15))
+                            .overlay(RoundedRectangle(cornerRadius: 15).stroke(Color.cyan.opacity(0.5), lineWidth: 2))
+                        
+                        // 自车图标 (模拟特斯拉渲染)
+                        VStack {
+                            Spacer()
+                            Image(systemName: "car.fill")
+                                .font(.system(size: 30))
+                                .foregroundColor(.white)
+                                .shadow(color: .cyan, radius: 10)
+                                .padding(.bottom, 10)
+                        }
+                    }
+                    .frame(width: 320, height: 180)
+                }
+            }
+            .padding(.bottom, 40)
+            .padding(.horizontal)
+            .background(LinearGradient(colors: [.clear, .black.opacity(0.8)], startPoint: .top, endPoint: .bottom))
         }
     }
+}
+
+@main
+struct MyADASApp: App {
+    var body: some Scene { WindowGroup { ContentView() } }
 }
