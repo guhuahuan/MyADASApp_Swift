@@ -15,9 +15,12 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     @Published var detections: [Detection] = []
     @Published var modelStatus: String = "正在初始化..."
     
+    // 改为强制非隔离，允许后台线程直接访问
     let captureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
-    private var model: VNCoreMLModel?
+    
+    // 使用非隔离变量存储模型，避开 Actor 限制
+    private var visionModel: VNCoreMLModel?
 
     override init() {
         super.init()
@@ -29,10 +32,10 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         do {
             let config = MLModelConfiguration()
             config.computeUnits = .all 
-            // 尝试加载编译后的 YOLO 模型
             if let modelURL = Bundle.main.url(forResource: "yolov8s", withExtension: "mlmodelc") {
                 let compiledModel = try MLModel(contentsOf: modelURL, configuration: config)
-                self.model = try VNCoreMLModel(for: compiledModel)
+                let vModel = try VNCoreMLModel(for: compiledModel)
+                self.visionModel = vModel
                 self.modelStatus = "YOLOv8 已激活"
             } else {
                 self.modelStatus = "使用系统内置检测"
@@ -44,7 +47,6 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
 
     func setupCapture() {
         captureSession.beginConfiguration()
-        // 设置高质量预览
         captureSession.sessionPreset = .hd1280x720
         
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -56,31 +58,28 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "camera_queue"))
         
         if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
-        
-        // 确保视频方向正确
-        if let connection = videoOutput.connection(with: .video) {
-            connection.videoOrientation = .portrait
-        }
-        
         captureSession.commitConfiguration()
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.captureSession.startRunning()
+        // 使用异步启动，避开并发警告
+        let session = self.captureSession
+        DispatchQueue.global(qos: .userInitiated).async {
+            session.startRunning()
         }
     }
 
+    // 摄像头回调：标记为 nonisolated
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
         let request: VNImageBasedRequest
-        if let yolomodel = self.model {
-            request = VNCoreMLRequest(model: yolomodel) { [weak self] req, _ in
-                self?.processResults(req.results)
+        // 访问本地缓存的模型变量
+        if let yolo = self.visionModel {
+            request = VNCoreMLRequest(model: yolo) { [weak self] req, _ in
+                self?.handleResults(req.results)
             }
         } else {
-            // 兜底：内置矩形检测
             request = VNDetectRectanglesRequest { [weak self] req, _ in
-                self?.processResults(req.results)
+                self?.handleResults(req.results)
             }
         }
         
@@ -88,21 +87,23 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         try? handler.perform([request])
     }
     
-    private func processResults(_ results: [Any]?) {
+    // 处理结果：标记为 nonisolated 并通过 Task 回到主线程更新 UI
+    nonisolated private func handleResults(_ results: [Any]?) {
         let observations = results as? [VNDetectedObjectObservation] ?? []
         let newDetections = observations.map { obs in
             Detection(
                 box: obs.boundingBox,
-                label: (obs as? VNRecognizedObjectObservation)?.labels.first?.identifier ?? "目标"
+                label: (obs as? VNRecognizedObjectObservation)?.labels.first?.identifier ?? "Target"
             )
         }
+        
         Task { @MainActor in
             self.detections = newDetections
         }
     }
 }
 
-// 3. 画面预览层（修复黑屏的关键）
+// 3. 画面预览
 struct CameraPreviewHolder: UIViewRepresentable {
     let session: AVCaptureSession
     
@@ -128,14 +129,11 @@ struct ContentView: View {
     
     var body: some View {
         ZStack {
-            // 背景摄像头画面
             CameraPreviewHolder(session: controller.captureSession)
                 .ignoresSafeArea()
             
-            // 覆盖检测框
             Canvas { context, size in
                 for d in controller.detections {
-                    // 坐标转换：Vision 是归一化坐标 (0-1)，需要转为屏幕像素
                     let rect = CGRect(
                         x: d.box.minX * size.width,
                         y: (1 - d.box.maxY) * size.height,
@@ -143,11 +141,9 @@ struct ContentView: View {
                         height: d.box.height * size.height
                     )
                     context.stroke(Path(rect), with: .color(.green), lineWidth: 2)
-                    context.draw(Text(d.label).foregroundColor(.green), at: CGPoint(x: rect.minX, y: rect.minY - 10))
                 }
             }
             
-            // 顶部状态栏
             VStack {
                 Text(controller.modelStatus)
                     .font(.caption.monospaced())
@@ -162,7 +158,6 @@ struct ContentView: View {
     }
 }
 
-// 5. 入口
 @main
 struct MyADASApp: App {
     var body: some Scene {
