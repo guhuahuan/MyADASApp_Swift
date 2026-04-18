@@ -3,17 +3,15 @@
 import AVFoundation
 import CoreImage
 import CoreMotion
+import CoreLocation
 
-// MARK: - 数据结构
-struct SafeModelContainer: @unchecked Sendable {
-    let visionModel: VNCoreMLModel
-}
-
+// MARK: - 全功能数据模型
 struct TrackedObject: Identifiable, Sendable {
     let id: UUID
     var label: String
     var distance: Float
     var ttc: Float
+    var acceleration: Float // 减速度监控
     var isCutIn: Bool
     var boundingBox: CGRect
 }
@@ -22,45 +20,71 @@ struct TrajectoryPath: Sendable {
     let points: [CGPoint]
 }
 
-// MARK: - ADAS 核心引擎
+// MARK: - ADAS 终极引擎
 @MainActor
 class ADASMasterViewModel: NSObject, ObservableObject {
     enum AlertLevel { case safe, warning, critical }
     
+    // UI 绑定属性
     @Published var trackedObjects: [TrackedObject] = []
     @Published var occupancyMask: CGImage?
     @Published var alertStatus: AlertLevel = .safe
     @Published var currentPath: TrajectoryPath?
+    @Published var currentSpeed: Double = 0.0 // km/h
+    @Published var speedLimit: Int = 0       // OCR 识别到的限速
     @Published var debugInfo: String = ""
     
+    // 硬件实例
     private let captureSession = AVCaptureSession()
-    private let queue = DispatchQueue(label: "com.adas.ultra.process", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "com.adas.ultra.engine", qos: .userInteractive)
     nonisolated(unsafe) private let context = CIContext()
-    nonisolated(unsafe) private var modelContainer: SafeModelContainer?
-    private let synthesizer = AVSpeechSynthesizer()
-    private var lastAlertTime = Date.distantPast
-
-    // Core Motion 传感器
     private let motionManager = CMMotionManager()
+    private let locationManager = CLLocationManager()
+    private let hapticGenerator = UIImpactFeedbackGenerator(style: .heavy)
+    private let synthesizer = AVSpeechSynthesizer()
+    
+    // 算法缓存
+    private var modelContainer: VNCoreMLModel?
+    private var lastDistances: [String: Float] = [:]
     private var baselinePitch: Double = 0.0
-    private var smoothPitchOffset: Double = 0.0
-    private let alpha: Double = 0.15 
-
+    private var smoothPitch: Double = 0.0
+    private var lastVoiceAlert = Date.distantPast
+    
     override init() {
         super.init()
-        setupSystem()
-        startMotionUpdates()
+        setupSensors()
+        setupVision()
+        hapticGenerator.prepare()
     }
 
-    // MARK: - 1. 系统初始化
-    private func setupSystem() {
+    // MARK: - 1. 传感器与定位初始化
+    private func setupSensors() {
+        // IMU 60Hz 采样用于姿态补偿
+        if motionManager.isDeviceMotionAvailable {
+            motionManager.deviceMotionUpdateInterval = 1.0 / 60.0
+            motionManager.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
+                guard let data = data, let self = self else { return }
+                if self.baselinePitch == 0.0 { self.baselinePitch = data.attitude.pitch }
+                self.smoothPitch = 0.15 * (data.attitude.pitch - self.baselinePitch) + 0.85 * self.smoothPitch
+            }
+        }
+        
+        // GPS 初始化
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
+        locationManager.requestWhenInUseAuthorization()
+        locationManager.startUpdatingLocation()
+    }
+
+    // MARK: - 2. 视觉系统初始化
+    private func setupVision() {
         Task {
             let config = MLModelConfiguration()
-            config.computeUnits = .all
+            config.computeUnits = .all 
             if let modelURL = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
                let coreML = try? MLModel(contentsOf: modelURL, configuration: config),
                let visionModel = try? VNCoreMLModel(for: coreML) {
-                self.modelContainer = SafeModelContainer(visionModel: visionModel)
+                self.modelContainer = visionModel
             }
             
             guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -74,120 +98,145 @@ class ADASMasterViewModel: NSObject, ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async { self.captureSession.startRunning() }
         }
     }
-
-    // MARK: - 2. IMU 姿态补偿 (动态测距核心)
-    private func startMotionUpdates() {
-        if motionManager.isDeviceMotionAvailable {
-            motionManager.deviceMotionUpdateInterval = 1.0 / 60.0
-            motionManager.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
-                guard let data = data, let self = self else { return }
-                let pitch = data.attitude.pitch
-                if self.baselinePitch == 0.0 { self.baselinePitch = pitch }
-                let rawOffset = pitch - self.baselinePitch
-                self.smoothPitchOffset = (self.alpha * rawOffset) + (1.0 - self.alpha) * self.smoothPitchOffset
-            }
-        }
-    }
-
-    // MARK: - 3. 3D 轨迹线投影 (Trajectory)
-    func updateTrajectory() {
-        let pitchAdj = Float(self.smoothPitchOffset)
-        let f: Float = 0.85 
-        let h_cam: Float = 1.2 
-
-        var points: [CGPoint] = []
-        for d in stride(from: 3.0, through: 30.0, by: 3.0) {
-            let y_norm = 1.0 - ((h_cam / Float(d)) * f + pitchAdj * 0.6)
-            let laneWidth = (3.5 / Float(d)) * f
-            points.append(CGPoint(x: CGFloat(0.5 - laneWidth/2), y: CGFloat(y_norm)))
-            points.append(CGPoint(x: CGFloat(0.5 + laneWidth/2), y: CGFloat(y_norm)))
-        }
-        self.currentPath = TrajectoryPath(points: points)
-    }
 }
 
-// MARK: - 4. 视频流回调与感知算法整合
-extension ADASMasterViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
+// MARK: - 3. 核心算法逻辑 (测距、TTC、高速增强)
+extension ADASMasterViewModel: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
+    
+    // GPS 速度回调
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        if let location = locations.last {
+            let speedKmH = max(0, location.speed * 3.6)
+            Task { @MainActor in self.currentSpeed = speedKmH }
+        }
+    }
+
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
+        // A. 实例分割（占用网络）
         let segRequest = VNGenerateForegroundInstanceMaskRequest()
-        guard let container = self.modelContainer else { return }
         
-        let detRequest = VNCoreMLRequest(model: container.visionModel) { request, _ in
+        // B. OCR 识别（限速牌识别）
+        let ocrRequest = VNRecognizeTextRequest { request, _ in
+            if let results = request.results as? [VNRecognizedTextObservation] {
+                self.parseSpeedSigns(results)
+            }
+        }
+        ocrRequest.recognitionLevel = .accurate
+        
+        // C. 目标检测
+        guard let model = self.modelContainer else { return }
+        let detRequest = VNCoreMLRequest(model: model) { request, _ in
             if let results = request.results as? [VNRecognizedObjectObservation] {
-                Task { @MainActor in self.analyzeEnvironment(results) }
+                Task { @MainActor in self.analyzeWorld(results) }
             }
         }
         detRequest.imageCropAndScaleOption = .scaleFill
         
-        try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right).perform([segRequest, detRequest])
+        try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right).perform([segRequest, ocrRequest, detRequest])
         
-        // 处理占用网络遮罩
+        // 处理分割遮罩
         if let observation = segRequest.results?.first {
             let ciMask = CIImage(cvPixelBuffer: observation.instanceMask)
             if let cgMask = self.context.createCGImage(ciMask, from: ciMask.extent) {
                 Task { @MainActor in 
                     self.occupancyMask = cgMask 
-                    self.updateTrajectory()
+                    self.updateTrajectory() // 更新 3D 线条
                 }
             }
         }
     }
 
     @MainActor
-    private func analyzeEnvironment(_ observations: [VNRecognizedObjectObservation]) {
-        var currentLevel: AlertLevel = .safe
+    private func analyzeWorld(_ observations: [VNRecognizedObjectObservation]) {
+        var highestAlert: AlertLevel = .safe
         var newObjects: [TrackedObject] = []
-        let pitchAdj = Float(self.smoothPitchOffset)
-
+        let isHighway = currentSpeed > 75.0
+        
         for obs in observations {
-            let label = obs.labels.first?.identifier ?? "Object"
-            let xPos = Float(obs.boundingBox.midX)
-            let yPosCompensated = Float(obs.boundingBox.origin.y) + (pitchAdj * 0.6)
+            let label = obs.labels.first?.identifier ?? "Target"
             
-            // 测距与 TTC 计算 (模拟)
-            let dist = 1.2 / (yPosCompensated + 0.05)
-            let ttc = dist / 15.0 // 简化模型：假设相对速度 15m/s
+            // 测距逻辑（含 IMU 姿态补偿）
+            let yCompensated = Float(obs.boundingBox.origin.y) + Float(smoothPitch) * 0.65
+            let distance = 1.2 / (yCompensated + 0.05)
             
-            // 侧向切入逻辑
-            let isCutIn = (xPos < 0.25 || xPos > 0.75) && dist < 8.0
+            // 幽灵刹车逻辑：计算加速度
+            let prevDist = lastDistances[label] ?? distance
+            let velocity = (prevDist - distance) * 30.0 // 相对速度 (m/s)
+            let ttc = distance / (velocity > 0 ? velocity : 0.1)
             
-            newObjects.append(TrackedObject(id: UUID(), label: label, distance: dist, ttc: ttc, isCutIn: isCutIn, boundingBox: obs.boundingBox))
-
-            // 预警决策
-            if (dist < 4.0 || ttc < 1.8 || isCutIn) && (label == "car" || label == "motorcycle" || label == "person") {
-                currentLevel = .critical
-                voiceAlert(msg: isCutIn ? "侧方切入" : "注意距离")
-            } else if dist < 8.0 {
-                if currentLevel != .critical { currentLevel = .warning }
+            // 切入检测
+            let isCutIn = (obs.boundingBox.midX < 0.2 || obs.boundingBox.midX > 0.8) && distance < 10.0
+            
+            // 高速模式阈值调整
+            let dangerDist: Float = isHighway ? 45.0 : 6.0
+            let dangerTTC: Float = isHighway ? 2.5 : 1.5
+            
+            if (distance < dangerDist || ttc < dangerTTC || isCutIn) && ["car", "motorcycle", "bus", "truck"].contains(label) {
+                highestAlert = .critical
+                if velocity > 5.0 { hapticGenerator.impactOccurred() } // 紧急制动震动
+                triggerVoice("危险")
             }
+            
+            newObjects.append(TrackedObject(id: UUID(), label: label, distance: distance, ttc: ttc, acceleration: 0, isCutIn: isCutIn, boundingBox: obs.boundingBox))
+            lastDistances[label] = distance
         }
         
         self.trackedObjects = newObjects
-        self.alertStatus = currentLevel
-        self.debugInfo = "PITCH: \(String(format: "%.2f", smoothPitchOffset)) | OBJ: \(newObjects.count)"
+        self.alertStatus = highestAlert
+        self.debugInfo = "SPEED: \(Int(currentSpeed))km/h | PITCH: \(String(format: "%.2f", smoothPitch))"
     }
 
-    private func voiceAlert(msg: String) {
-        if Date().timeIntervalSince(lastAlertTime) > 4.0 {
+    private func parseSpeedSigns(_ observations: [VNRecognizedTextObservation]) {
+        for obs in observations {
+            if let topCandidate = obs.topCandidates(1).first {
+                let text = topCandidate.string.filter { $0.isNumber }
+                if let val = Int(text), val >= 40 && val <= 120 {
+                    Task { @MainActor in self.speedLimit = val }
+                }
+            }
+        }
+    }
+
+    private func updateTrajectory() {
+        let isHighway = currentSpeed > 70.0
+        let h_cam: Float = 1.2
+        let f: Float = 0.85
+        let pAdj = Float(smoothPitch)
+        
+        var pts: [CGPoint] = []
+        // 高速模式轨迹延伸至 60 米
+        let range = isHighway ? stride(from: 4.0, through: 60.0, by: 4.0) : stride(from: 2.0, through: 25.0, by: 2.0)
+        
+        for d in range {
+            let yNorm = 1.0 - ((h_cam / Float(d)) * f + pAdj * 0.6)
+            let laneW = (3.5 / Float(d)) * f
+            pts.append(CGPoint(x: CGFloat(0.5 - laneW/2), y: CGFloat(yNorm)))
+            pts.append(CGPoint(x: CGFloat(0.5 + laneW/2), y: CGFloat(yNorm)))
+        }
+        self.currentPath = TrajectoryPath(points: pts)
+    }
+
+    private func triggerVoice(_ msg: String) {
+        if Date().timeIntervalSince(lastVoiceAlert) > 3.0 {
             let utterance = AVSpeechUtterance(string: msg)
             utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
             synthesizer.speak(utterance)
-            lastAlertTime = Date()
+            lastVoiceAlert = Date()
         }
     }
 }
 
-// MARK: - 5. 视图层 (Tesla 风格 UI)
-struct ADASView: View {
+// MARK: - 4. UI 界面
+struct ADASContentView: View {
     @StateObject var viewModel = ADASMasterViewModel()
     
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             
-            // 占用网络层
+            // 占用网络遮罩
             if let mask = viewModel.occupancyMask {
                 Image(decorative: mask, scale: 1.0)
                     .resizable()
@@ -197,7 +246,7 @@ struct ADASView: View {
             }
             
             GeometryReader { geo in
-                // 3D 轨迹线
+                // 3D 轨迹线投影
                 if let path = viewModel.currentPath {
                     Path { p in
                         let w = geo.size.width
@@ -207,41 +256,48 @@ struct ADASView: View {
                         p.move(to: CGPoint(x: path.points[1].x * w, y: path.points[1].y * h))
                         for i in stride(from: 3, to: path.points.count, by: 2) { p.addLine(to: CGPoint(x: path.points[i].x * w, y: path.points[i].y * h)) }
                     }
-                    .stroke(viewModel.alertStatus == .critical ? Color.red : Color.cyan, lineWidth: 3)
+                    .stroke(viewModel.alertStatus == .critical ? Color.red : Color.cyan, lineWidth: 4)
                 }
                 
-                // 目标框与距离显示
+                // 目标检测框
                 ForEach(viewModel.trackedObjects) { obj in
                     let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
-                    let color: Color = obj.isCutIn ? .orange : (obj.distance < 5 ? .red : .green)
+                    let color: Color = obj.isCutIn ? .orange : (obj.distance < 10 ? .red : .green)
                     
                     VStack(alignment: .leading, spacing: 0) {
                         Text("\(obj.label.uppercased()) \(String(format: "%.1fm", obj.distance))")
-                            .font(.system(size: 10, weight: .black, design: .monospaced))
-                            .padding(2).background(color).foregroundColor(.white)
+                            .font(.system(size: 12, weight: .black, design: .monospaced))
+                            .padding(4).background(color).foregroundColor(.white)
                         Rectangle().stroke(color, lineWidth: 2).frame(width: rect.width, height: rect.height)
                     }
                     .position(x: rect.midX, y: geo.size.height - rect.midY)
                 }
             }
             
-            // 底部数据面板
+            // 仪表盘 HUD
             VStack {
-                Spacer()
                 HStack {
-                    Text(viewModel.debugInfo).foregroundColor(.cyan)
+                    VStack(alignment: .leading) {
+                        Text("\(Int(viewModel.currentSpeed))")
+                            .font(.system(size: 50, weight: .black, design: .monospaced))
+                            .foregroundColor(.white)
+                        Text("KM/H").font(.caption).foregroundColor(.gray)
+                    }
                     Spacer()
-                    Circle().fill(viewModel.alertStatus == .critical ? Color.red : Color.green).frame(width: 10, height: 10)
-                    Text(viewModel.alertStatus == .critical ? "DANGER" : "SYSTEM READY")
-                }
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .padding().background(.ultraThinMaterial)
+                    if viewModel.speedLimit > 0 {
+                        ZStack {
+                            Circle().strokeBorder(Color.red, lineWidth: 8).background(Circle().fill(.white))
+                            Text("\(viewModel.speedLimit)").font(.system(size: 24, weight: .bold)).foregroundColor(.black)
+                        }.frame(width: 70, height: 70)
+                    }
+                }.padding(30)
+                
+                Spacer()
+                
+                Text(viewModel.debugInfo)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(.white).padding().background(.black.opacity(0.5))
             }
         }
     }
-}
-
-@main
-struct ADASApp: App {
-    var body: some Scene { WindowGroup { ADASView() } }
 }
