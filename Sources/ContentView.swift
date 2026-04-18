@@ -2,36 +2,66 @@
 @preconcurrency import Vision
 import AVFoundation
 import CoreImage
+import CoreMotion
 
-// MARK: - 增强版追踪模型
+// MARK: - 线程安全容器
+struct SafeModelContainer: @unchecked Sendable {
+    let visionModel: VNCoreMLModel
+}
+
 struct TrackedObject: Identifiable, Sendable {
     let id: UUID
     var label: String
     var distance: Float
-    var lastDistance: Float
-    var speed: Float // 相对速度 m/s
-    var ttc: Float   // Time to Collision
     var boundingBox: CGRect
-    var timestamp: Date
 }
 
+// MARK: - ADAS 核心引擎
 @MainActor
 class ADASMasterViewModel: NSObject, ObservableObject {
-    @Published var trackedObjects: [UUID: TrackedObject] = [:]
+    @Published var trackedObjects: [TrackedObject] = []
     @Published var occupancyMask: CGImage?
     @Published var alertStatus: AlertLevel = .safe
+    @Published var pitchDebug: Double = 0.0 // 用于调试实时俯仰角
     
     enum AlertLevel { case safe, warning, critical }
 
     private let captureSession = AVCaptureSession()
-    private let queue = DispatchQueue(label: "adas.master.worker", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "adas.worker.queue", qos: .userInteractive)
     nonisolated(unsafe) private let context = CIContext()
     nonisolated(unsafe) private var modelContainer: SafeModelContainer?
     private let synthesizer = AVSpeechSynthesizer()
-
+    
+    // Core Motion 动力
+    private let motionManager = CMMotionManager()
+    private var baselinePitch: Double = 0.0
+    private var smoothPitchOffset: Double = 0.0
+    private let alpha: Double = 0.15 // 低通滤波系数
+    
     override init() {
         super.init()
         setupSystem()
+        startMotionUpdates()
+    }
+
+    // MARK: - IMU 姿态感知
+    private func startMotionUpdates() {
+        if motionManager.isDeviceMotionAvailable {
+            motionManager.deviceMotionUpdateInterval = 1.0 / 60.0 // 60Hz 采样，保证平滑
+            motionManager.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
+                guard let data = data, let self = self else { return }
+                
+                let currentPitch = data.attitude.pitch
+                if self.baselinePitch == 0.0 { self.baselinePitch = currentPitch }
+                
+                // 实时偏差计算
+                let rawOffset = currentPitch - self.baselinePitch
+                
+                // 关键：低通滤波处理，过滤掉引擎高频振动，保留路面颠簸趋势
+                self.smoothPitchOffset = (self.alpha * rawOffset) + (1.0 - self.alpha) * self.smoothPitchOffset
+                self.pitchDebug = self.smoothPitchOffset
+            }
+        }
     }
 
     private func setupSystem() {
@@ -55,9 +85,14 @@ class ADASMasterViewModel: NSObject, ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async { self.captureSession.startRunning() }
         }
     }
+
+    // 重置校准基准 (当你把手机卡在架子上停稳后点一下)
+    func resetCalibration() {
+        self.baselinePitch = 0.0
+    }
 }
 
-// MARK: - 核心算法逻辑 (1, 2, 3 功能整合)
+// MARK: - 视觉推理与补偿算法
 extension ADASMasterViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
@@ -74,7 +109,7 @@ extension ADASMasterViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
         
         try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right).perform([segRequest, detRequest])
         
-        // 功能 2: 利用遮罩计算车道偏移 (LDW)
+        // 占用网络渲染
         if let observation = segRequest.results?.first {
             let maskBuffer = observation.instanceMask
             let ciMask = CIImage(cvPixelBuffer: maskBuffer)
@@ -87,43 +122,52 @@ extension ADASMasterViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
     @MainActor
     private func analyzeWorld(_ observations: [VNRecognizedObjectObservation]) {
         var currentAlert: AlertLevel = .safe
-        let now = Date()
+        var newObjects: [TrackedObject] = []
+        
+        // 获取实时 IMU 补偿值
+        let pitchAdjustment = Float(self.smoothPitchOffset)
 
         for obs in observations {
             let label = obs.labels.first?.identifier ?? "Target"
-            let currentDist = 1.2 / (Float(obs.boundingBox.origin.y) + 0.05)
-            let xPos = obs.boundingBox.midX
             
-            // 功能 1 & 3: TTC 与 盲区切入逻辑
-            // 简单模拟追踪 (实际可根据 bbox 重合度匹配 ID)
-            let lastDist = currentDist // 这里简化处理，建议实测时加入 Dictionary 存储上帧数据
-            let deltaTime = 0.033 // 约 30fps
-            let speed = (lastDist - currentDist) / Float(deltaTime)
-            let ttc = speed > 0 ? currentDist / speed : 99.0
+            // 原始 Y 轴中心点
+            let originalY = Float(obs.boundingBox.origin.y)
             
-            // 盲区预警逻辑：如果物体在边缘且向中心移动
-            let isCutIn = (xPos < 0.2 || xPos > 0.8) && currentDist < 6.0
+            // --- 核心补偿公式 ---
+            // 1. 如果手机向上仰（pitch > 0），视觉上物体会下移，y变小，我们需要加上这个偏移
+            // 2. 0.6 是针对 iPhone 镜头焦距的转换增益系数
+            let compensatedY = originalY + (pitchAdjustment * 0.6)
+            
+            // 测距算法 (H=1.2米)
+            let dist = 1.2 / (compensatedY + 0.05)
+            
+            let tracked = TrackedObject(id: UUID(), label: label, distance: dist, boundingBox: obs.boundingBox)
+            newObjects.append(tracked)
 
-            if ttc < 1.5 || currentDist < 2.5 || isCutIn {
+            // TTC 与报警逻辑
+            if dist < 3.0 && (label == "car" || label == "motorcycle") {
                 currentAlert = .critical
-                triggerAlert(label: label, dist: currentDist, isCutIn: isCutIn)
-            } else if ttc < 3.0 || currentDist < 5.0 {
+                triggerVoiceAlert(label: label, d: dist)
+            } else if dist < 6.0 {
                 currentAlert = .warning
             }
         }
+        
+        self.trackedObjects = newObjects
         self.alertStatus = currentAlert
     }
 
-    private func triggerAlert(label: String, dist: Float, isCutIn: Bool) {
+    private func triggerVoiceAlert(label: String, d: Float) {
         if synthesizer.isSpeaking { return }
-        let msg = isCutIn ? "侧方车辆切入" : "注意前方\(Int(dist))米障碍物"
+        let msg = "注意前方 \(Int(d)) 米 \(label == "motorcycle" ? "摩托车" : "汽车")"
         let utterance = AVSpeechUtterance(string: msg)
         utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+        utterance.rate = 0.55
         synthesizer.speak(utterance)
     }
 }
 
-// MARK: - 特斯拉 3.0 UI 布局
+// MARK: - UI 界面
 struct ContentView: View {
     @StateObject var viewModel = ADASMasterViewModel()
     
@@ -131,7 +175,7 @@ struct ContentView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             
-            // 功能 2: 占用网络渲染
+            // 占用网络
             if let mask = viewModel.occupancyMask {
                 Image(decorative: mask, scale: 1.0)
                     .resizable()
@@ -140,49 +184,66 @@ struct ContentView: View {
                     .ignoresSafeArea()
             }
             
-            // 功能 1: 侧方流光预警
-            HStack {
-                Rectangle().fill(LinearGradient(colors: [.red.opacity(0.5), .clear], startPoint: .leading, endPoint: .trailing))
-                    .frame(width: 40).opacity(viewModel.alertStatus == .critical ? 1 : 0)
-                Spacer()
-                Rectangle().fill(LinearGradient(colors: [.clear, .red.opacity(0.5)], startPoint: .leading, endPoint: .trailing))
-                    .frame(width: 40).opacity(viewModel.alertStatus == .critical ? 1 : 0)
-            }.ignoresSafeArea()
-
-            // 底部特斯拉风格面板
+            // 检测框渲染
+            GeometryReader { geo in
+                ForEach(viewModel.trackedObjects) { obj in
+                    let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
+                    let color: Color = obj.distance < 4 ? .red : .green
+                    
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("\(obj.label.uppercased()) \(String(format: "%.1f", obj.distance))M")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .padding(2)
+                            .background(color)
+                            .foregroundColor(.white)
+                        
+                        Rectangle()
+                            .stroke(color, lineWidth: 2)
+                            .frame(width: rect.width, height: rect.height)
+                    }
+                    .position(x: rect.midX, y: geo.size.height - rect.midY)
+                }
+            }
+            
+            // 顶部调试信息
             VStack {
-                Spacer()
-                HStack(spacing: 20) {
-                    VStack {
-                        Text("TTC").font(.caption2)
-                        Text(viewModel.alertStatus == .critical ? "LOW" : "OK").bold()
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text("IMU PITCH: \(String(format: "%.3f", viewModel.pitchDebug))")
+                        Text("CALIBRATION: ACTIVE")
                     }
-                    Divider().frame(height: 30)
-                    VStack {
-                        Text("SPEED REL").font(.caption2)
-                        Text("ACTIVE").bold()
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.yellow)
+                    Spacer()
+                    Button("校准 (RESET)") {
+                        viewModel.resetCalibration()
                     }
-                    Divider().frame(height: 30)
-                    VStack {
-                        Text("LATERAL").font(.caption2)
-                        Text("MONITOR").bold()
-                    }
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(8)
+                    .background(Color.yellow)
+                    .foregroundColor(.black)
+                    .cornerRadius(5)
                 }
                 .padding()
-                .background(.ultraThinMaterial)
-                .cornerRadius(15)
-                .foregroundColor(.white)
-                .padding(.bottom, 30)
+                Spacer()
+            }
+            
+            // 碰撞警告视觉
+            if viewModel.alertStatus == .critical {
+                VStack {
+                    Text("⚠️ BRAKE ⚠️")
+                        .font(.system(size: 60, weight: .black))
+                        .foregroundColor(.red)
+                        .padding()
+                        .background(Color.white.opacity(0.8))
+                        .cornerRadius(20)
+                }
             }
         }
     }
 }
 
-// MARK: - 模型辅助
-struct SafeModelContainer: @unchecked Sendable {
-    let visionModel: VNCoreMLModel
-}
-
+// MARK: - 入口
 @main
 struct ADASApp: App {
     var body: some Scene { WindowGroup { ContentView() } }
