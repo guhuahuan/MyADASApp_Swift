@@ -1,83 +1,87 @@
-name: ADAS-Final-Build-v12
+name: ADAS-Global-System-Build
 
-on: [push]
+on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
       
-      - name: Set up Xcode
+      - name: Set up Xcode 16
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      - name: Prepare Source
+      - name: Download iOS 18 Platform
+        # Xcode 16 默认不带 iOS SDK，这一步必不可少
+        run: xcodebuild -downloadPlatform iOS
+
+      - name: Prepare Workspace
         run: |
+          # 1. 临时挪动模型文件以便后续手动编译
           mkdir -p ModelTemp
           if [ -d "Sources/yolov8s.mlpackage" ]; then
             mv Sources/yolov8s.mlpackage ModelTemp/
           fi
-          # 彻底清除可能存在的 Entitlements 或 App 入口冲突
-          find Sources -name "MyADASApp.swift" -delete
-          ls -R Sources/
-
-      - name: Build Binary
-        run: |
-          # 1. 自动寻找 Scheme
-          SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
           
-          # 2. 【核心改动】显式指定使用 iphoneos SDK，并关闭所有签名验证
+          # 2. 清理可能导致重复入口冲突的文件
+          find Sources -name "MyADASApp.swift" -delete
+
+      - name: Build and Archive
+        run: |
+          # 自动获取 Scheme 名称
+          SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
+          echo "Building Scheme: $SCHEME_NAME"
+          
+          # 执行 Archive 操作，禁用签名限制
           xcodebuild archive \
             -scheme "$SCHEME_NAME" \
-            -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -archivePath ./build/MyADAS.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_ENTITLEMENTS="" \
-            CODE_SIGNING_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            COREML_CODEGEN_LANGUAGE=None \
             SWIFT_OPTIMIZATION_LEVEL=-Onone
 
-      - name: Industrial Manual Packaging
+      - name: Package IPA (Manual Assembly)
         run: |
-          mkdir -p MyADASApp.app
+          # 1. 创建符合 iOS 标准的 Payload 结构
+          mkdir -p Payload/MyADASApp.app
           
-          # 提取二进制文件
-          BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f | grep "bin/" | head -n 1)
-          cp "$BINARY_PATH" MyADASApp.app/MyADASApp
+          # 2. 提取编译好的二进制文件
+          BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f -perm +111 | grep ".app/" | head -n 1)
+          cp "$BINARY_PATH" Payload/MyADASApp.app/MyADASApp
           
-          # 编译模型
+          # 3. 编译 CoreML 模型到 App 包内
           if [ -d "ModelTemp/yolov8s.mlpackage" ]; then
-            xcrun coremlc compile ModelTemp/yolov8s.mlpackage MyADASApp.app/
+            xcrun coremlc compile ModelTemp/yolov8s.mlpackage Payload/MyADASApp.app/
           fi
           
-          # 生成 Info.plist
-          cat <<EOF > MyADASApp.app/Info.plist
+          # 4. 强制生成 Info.plist (包含摄像头权限)
+          cat <<EOF > Payload/MyADASApp.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
               <key>CFBundleExecutable</key> <string>MyADASApp</string>
-              <key>CFBundleIdentifier</key> <string>com.adas.tester</string>
-              <key>CFBundleName</key> <string>MyADAS</string>
+              <key>CFBundleIdentifier</key> <string>com.adas.global.system</string>
+              <key>CFBundleName</key> <string>GlobalADAS</string>
               <key>CFBundlePackageType</key> <string>APPL</string>
               <key>CFBundleShortVersionString</key> <string>1.0</string>
               <key>CFBundleVersion</key> <string>1</string>
               <key>LSRequiresIPhoneOS</key> <true/>
-              <key>NSCameraUsageDescription</key> <string>摄像头用于道路识别</string>
+              <key>NSCameraUsageDescription</key> <string>需要摄像头进行交通风险预判</string>
               <key>UILaunchScreen</key> <dict/>
+              <key>MinimumOSVersion</key> <string>17.0</string>
           </dict>
           </plist>
           EOF
+          
+          # 5. 压缩成 IPA
+          zip -r Global_ADAS_System.ipa Payload
 
-          mkdir -p Payload
-          cp -r MyADASApp.app Payload/
-          zip -r MyADAS_Final.ipa Payload
-
-      - name: Upload Artifact
+      - name: Upload Result
         uses: actions/upload-artifact@v4
         with:
-          name: MyADAS-Final-IPA
-          path: MyADAS_Final.ipa
+          name: ADAS-iPhone-Build
+          path: Global_ADAS_System.ipa
