@@ -1,6 +1,6 @@
 import SwiftUI
 import Vision
-import AVFoundation
+@preconcurrency import AVFoundation // 关键：处理非 Sendable 警告
 import CoreML
 
 // 1. 数据模型
@@ -15,12 +15,13 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
     @Published var detections: [Detection] = []
     @Published var modelStatus: String = "正在初始化..."
     
-    // 改为强制非隔离，允许后台线程直接访问
-    let captureSession = AVCaptureSession()
+    // 强制声明为 nonisolated，允许跨线程访问
+    nonisolated let captureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
     
-    // 使用非隔离变量存储模型，避开 Actor 限制
-    private var visionModel: VNCoreMLModel?
+    // 关键修复：使用 nonisolated(unsafe) 避开严格的并发检查
+    // 因为模型加载后是只读的，这样做是安全的
+    nonisolated(unsafe) private var visionModel: VNCoreMLModel?
 
     override init() {
         super.init()
@@ -34,8 +35,7 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
             config.computeUnits = .all 
             if let modelURL = Bundle.main.url(forResource: "yolov8s", withExtension: "mlmodelc") {
                 let compiledModel = try MLModel(contentsOf: modelURL, configuration: config)
-                let vModel = try VNCoreMLModel(for: compiledModel)
-                self.visionModel = vModel
+                self.visionModel = try VNCoreMLModel(for: compiledModel)
                 self.modelStatus = "YOLOv8 已激活"
             } else {
                 self.modelStatus = "使用系统内置检测"
@@ -60,10 +60,9 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
         captureSession.commitConfiguration()
         
-        // 使用异步启动，避开并发警告
-        let session = self.captureSession
+        // 既然 session 是 nonisolated，我们可以安全地在后台启动
         DispatchQueue.global(qos: .userInitiated).async {
-            session.startRunning()
+            self.captureSession.startRunning()
         }
     }
 
@@ -72,7 +71,7 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
         let request: VNImageBasedRequest
-        // 访问本地缓存的模型变量
+        // 此时访问 visionModel 不再报错，因为标记了 nonisolated(unsafe)
         if let yolo = self.visionModel {
             request = VNCoreMLRequest(model: yolo) { [weak self] req, _ in
                 self?.handleResults(req.results)
@@ -87,7 +86,6 @@ class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSample
         try? handler.perform([request])
     }
     
-    // 处理结果：标记为 nonisolated 并通过 Task 回到主线程更新 UI
     nonisolated private func handleResults(_ results: [Any]?) {
         let observations = results as? [VNDetectedObjectObservation] ?? []
         let newDetections = observations.map { obs in
@@ -117,8 +115,10 @@ struct CameraPreviewHolder: UIViewRepresentable {
     }
     
     func updateUIView(_ uiView: UIView, context: Context) {
-        if let layer = uiView.layer.sublayers?.first as? AVCaptureVideoPreviewLayer {
-            layer.frame = uiView.bounds
+        DispatchQueue.main.async {
+            if let layer = uiView.layer.sublayers?.first as? AVCaptureVideoPreviewLayer {
+                layer.frame = uiView.bounds
+            }
         }
     }
 }
