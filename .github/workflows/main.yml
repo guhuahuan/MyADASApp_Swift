@@ -1,4 +1,4 @@
-name: ADAS-Global-System-Build
+name: ADAS-Global-Final-Fix
 
 on: [push, workflow_dispatch]
 
@@ -10,54 +10,54 @@ jobs:
         uses: actions/checkout@v4
       
       - name: Set up Xcode 16
-        run: sudo xcode-select -s /Applications/Xcode_16.app
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.app
+          # 关键 1: 强制执行 Xcode 首次启动初始化
+          sudo xcodebuild -runFirstLaunch
 
-      - name: Download iOS 18 Platform
-        # Xcode 16 默认不带 iOS SDK，这一步必不可少
-        run: xcodebuild -downloadPlatform iOS
+      - name: Wake Up Simulator Service
+        run: |
+          # 关键 2: 唤醒并列出模拟器，防止 CoreML 编译时找不到服务
+          xcrun simctl list
+          # 尝试下载平台（如果没下载的话），增加重试机制
+          xcodebuild -downloadPlatform iOS || true
 
       - name: Prepare Workspace
         run: |
-          # 1. 临时挪动模型文件以便后续手动编译
           mkdir -p ModelTemp
           if [ -d "Sources/yolov8s.mlpackage" ]; then
             mv Sources/yolov8s.mlpackage ModelTemp/
           fi
-          
-          # 2. 清理可能导致重复入口冲突的文件
           find Sources -name "MyADASApp.swift" -delete
 
       - name: Build and Archive
         run: |
-          # 自动获取 Scheme 名称
+          # 关键 3: 明确指定 SDK 为 iphoneos，并增加超时容忍
           SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
-          echo "Building Scheme: $SCHEME_NAME"
           
-          # 执行 Archive 操作，禁用签名限制
           xcodebuild archive \
             -scheme "$SCHEME_NAME" \
+            -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -archivePath ./build/MyADAS.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO \
             SWIFT_OPTIMIZATION_LEVEL=-Onone
 
-      - name: Package IPA (Manual Assembly)
+      - name: Package IPA
         run: |
-          # 1. 创建符合 iOS 标准的 Payload 结构
           mkdir -p Payload/MyADASApp.app
-          
-          # 2. 提取编译好的二进制文件
           BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f -perm +111 | grep ".app/" | head -n 1)
           cp "$BINARY_PATH" Payload/MyADASApp.app/MyADASApp
           
-          # 3. 编译 CoreML 模型到 App 包内
+          # 编译模型
           if [ -d "ModelTemp/yolov8s.mlpackage" ]; then
             xcrun coremlc compile ModelTemp/yolov8s.mlpackage Payload/MyADASApp.app/
           fi
           
-          # 4. 强制生成 Info.plist (包含摄像头权限)
+          # 生成 Info.plist
           cat <<EOF > Payload/MyADASApp.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -77,7 +77,6 @@ jobs:
           </plist>
           EOF
           
-          # 5. 压缩成 IPA
           zip -r Global_ADAS_System.ipa Payload
 
       - name: Upload Result
