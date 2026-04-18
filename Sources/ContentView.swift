@@ -1,129 +1,143 @@
 import SwiftUI
 import Vision
 import AVFoundation
+import CoreML
+
+// 1. 定义检测结果结构
+struct Detection: Sendable {
+    let box: CGRect
+    let label: String
+}
 
 @MainActor
 class ADASController: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    // 核心修改：将 [VNRectangleObservation] 改为 [CGRect]，因为 CGRect 是 Sendable 的安全值类型
-    @Published var detectedRects: [CGRect] = []
-    
-    private let captureSession = AVCaptureSession()
+    @Published var detections: [Detection] = []
+    let captureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
-    private let queue = DispatchQueue(label: "com.adas.vision.queue")
-    
+    private var model: VNCoreMLModel?
+
     override init() {
         super.init()
-        setupCaptureSession()
+        loadModel()
+        setupCapture()
     }
-    
-    private func setupCaptureSession() {
-        #if targetEnvironment(simulator)
-        print("Simulator detected: Skipping camera hardware init.")
-        #else
+
+    private func loadModel() {
+        do {
+            // 注意：编译后模型后缀会变成 .mlmodelc
+            let config = MLModelConfiguration()
+            config.computeUnits = .all 
+            if let modelURL = Bundle.main.url(forResource: "yolov8s", withExtension: "mlmodelc") {
+                let coreMLModel = try MLModel(contentsOf: modelURL, configuration: config)
+                self.model = try VNCoreMLModel(for: coreMLModel)
+                print("✅ YOLOv8 模型加载成功")
+            } else {
+                print("❌ 未找到模型文件")
+            }
+        } catch {
+            print("❌ 模型初始化失败: \(error)")
+        }
+    }
+
+    func setupCapture() {
         captureSession.beginConfiguration()
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+              let input = try? AVCaptureDeviceInput(device: device) else { return }
         
-        guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let videoInput = try? AVCaptureDeviceInput(device: videoDevice) else {
-            captureSession.commitConfiguration()
-            return
-        }
+        if captureSession.canAddInput(input) { captureSession.addInput(input) }
         
-        if captureSession.canAddInput(videoInput) {
-            captureSession.addInput(videoInput)
-        }
-        
-        videoOutput.setSampleBufferDelegate(self, queue: queue)
-        if captureSession.canAddOutput(videoOutput) {
-            captureSession.addOutput(videoOutput)
-        }
-        
+        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "video_queue"))
+        if captureSession.canAddOutput(videoOutput) { captureSession.addOutput(videoOutput) }
         captureSession.commitConfiguration()
         
-        Task {
-            self.captureSession.startRunning()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.captureSession.startRunning()
         }
-        #endif
     }
-    
+
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        let request = VNDetectRectanglesRequest { request, error in
-            if let results = request.results as? [VNRectangleObservation] {
-                // 核心修改：在后台线程提取纯值类型 CGRect (Sendable)，丢弃无法跨线程的 Vision 对象
-                let boundingBoxes = results.map { $0.boundingBox }
-                
-                Task { @MainActor in
-                    // 传递 Sendable 数组，彻底消除 Swift 6 编译报错
-                    self.detectedRects = boundingBoxes
-                }
+        let request: VNImageBasedRequest
+        // 如果加载了 YOLO 就用 YOLO，否则用系统自带的矩形检测作为兜底
+        if let model = self.model {
+            request = VNCoreMLRequest(model: model) { [weak self] req, _ in
+                let results = req.results as? [VNRecognizedObjectObservation] ?? []
+                let boxes = results.map { Detection(box: $0.boundingBox, label: $0.labels.first?.identifier ?? "Target") }
+                Task { @MainActor [weak self] in self?.detections = boxes }
+            }
+        } else {
+            request = VNDetectRectanglesRequest { [weak self] req, _ in
+                let results = req.results as? [VNRectangleObservation] ?? []
+                let boxes = results.map { Detection(box: $0.boundingBox, label: "Scanning...") }
+                Task { @MainActor [weak self] in self?.detections = boxes }
             }
         }
         
-        request.minimumConfidence = 0.5
-        request.maximumObservations = 5
-        
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
         try? handler.perform([request])
     }
 }
 
-struct CameraPreviewView: UIViewRepresentable {
+// 2. 摄像头预览层 (修复黑屏关键)
+struct CameraView: UIViewRepresentable {
+    let session: AVCaptureSession
+    
     func makeUIView(context: Context) -> UIView {
         let view = UIView(frame: UIScreen.main.bounds)
-        view.backgroundColor = .black
-        
-        #if targetEnvironment(simulator)
-        let label = UILabel()
-        label.text = "ADAS 视觉待命 (模拟器)"
-        label.textColor = .green
-        label.textAlignment = .center
-        label.frame = view.bounds
-        view.addSubview(label)
-        #endif
-        
+        let layer = AVCaptureVideoPreviewLayer(session: session)
+        layer.videoGravity = .resizeAspectFill
+        layer.frame = view.layer.bounds
+        view.layer.addSublayer(layer)
         return view
     }
     
-    func updateUIView(_ uiView: UIView, context: Context) {}
+    func updateUIView(_ uiView: UIView, context: Context) {
+        if let layer = uiView.layer.sublayers?.first as? AVCaptureVideoPreviewLayer {
+            layer.frame = uiView.bounds
+        }
+    }
 }
 
+// 3. 主界面
 struct ContentView: View {
-    @StateObject private var adas = ADASController()
+    @StateObject var controller = ADASController()
     
     var body: some View {
         ZStack {
-            CameraPreviewView()
+            CameraView(session: controller.captureSession)
                 .ignoresSafeArea()
             
+            // 实时绘制检测框
             Canvas { context, size in
-                // 核心修改：迭代纯 CGRect 数组
-                for box in adas.detectedRects {
-                    let drawRect = calculateRect(box, in: size)
-                    context.stroke(Path(drawRect), with: .color(.green), lineWidth: 2)
-                    
-                    let text = context.resolve(Text("DETECTED").font(.system(size: 10, weight: .bold)))
-                    context.draw(text, at: CGPoint(x: drawRect.midX, y: drawRect.minY - 8))
+                for d in controller.detections {
+                    let rect = CGRect(
+                        x: d.box.minX * size.width,
+                        y: (1 - d.box.maxY) * size.height,
+                        width: d.box.width * size.width,
+                        height: d.box.height * size.height
+                    )
+                    context.stroke(Path(rect), with: .color(.green), lineWidth: 2)
+                    context.draw(Text(d.label).foregroundColor(.green).font(.caption), at: CGPoint(x: rect.minX, y: rect.minY - 10))
                 }
             }
             
+            // 状态指示器
             VStack {
-                Text("Vision 内置检测模式")
-                    .font(.caption)
-                    .padding(6)
-                    .background(Capsule().fill(Color.black.opacity(0.6)))
-                    .foregroundColor(.green)
-                    .padding(.top, 50)
+                HStack {
+                    Circle()
+                        .fill(controller.model != nil ? Color.green : Color.red)
+                        .frame(width: 10, height: 10)
+                    Text(controller.model != nil ? "YOLOv8 Active" : "Vision Mode")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.white)
+                }
+                .padding(8)
+                .background(Color.black.opacity(0.7))
+                .cornerRadius(20)
+                .padding(.top, 50)
                 Spacer()
             }
         }
-    }
-    
-    private func calculateRect(_ box: CGRect, in size: CGSize) -> CGRect {
-        let w = box.width * size.width
-        let h = box.height * size.height
-        let x = box.minX * size.width
-        let y = (1 - box.maxY) * size.height
-        return CGRect(x: x, y: y, width: w, height: h)
     }
 }
