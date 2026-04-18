@@ -1,4 +1,4 @@
-name: ADAS-Final-Build
+name: ADAS-Final-Build-v7
 
 on: [push]
 
@@ -16,13 +16,14 @@ jobs:
           # 自动获取工程名
           SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
           
-          # 执行归档打包
+          # 执行归档打包，加入 COREML_CODEGEN_LANGUAGE=None 避开语言检测报错
           xcodebuild archive \
             -scheme "$SCHEME_NAME" \
             -destination 'generic/platform=iOS' \
             -archivePath ./build/MyADAS.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_REQUIRED=NO \
+            COREML_CODEGEN_LANGUAGE=None
 
       - name: Industrial Manual Packaging
         run: |
@@ -33,11 +34,11 @@ jobs:
           BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f | grep "bin/" | head -n 1)
           cp "$BINARY_PATH" MyADASApp.app/MyADASApp
           
-          # 3. 【关键】在云端编译 YOLO 模型为 iOS 可用的格式
-          # 假设模型就在 Sources 目录下
+          # 3. 编译 YOLO 模型
+          # xcrun 会将你的 .mlpackage 编译成 iOS 运行时真正需要的 .mlmodelc 文件夹
           xcrun coremlc compile Sources/yolov8s.mlpackage MyADASApp.app/
           
-          # 4. 写入 App 身份证 (Info.plist)
+          # 4. 写入 Info.plist
           cat <<EOF > MyADASApp.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -56,7 +57,7 @@ jobs:
           </plist>
           EOF
 
-          # 5. 压缩成 IPA
+          # 5. 封装成 IPA
           mkdir -p Payload
           cp -r MyADASApp.app Payload/
           zip -r MyADAS_Final.ipa Payload
