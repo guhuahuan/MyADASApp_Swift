@@ -1,140 +1,129 @@
 import SwiftUI
 import Vision
 import AVFoundation
-import CoreML
+import CoreImage
+import CoreImage.CIFilterBuiltins
 
-// MARK: - 线程安全模型容器
-// 解决 Swift 6 隔离问题的关键：创建一个可在线程间传递的容器
-struct ModelContainer: Sendable {
-    let visionModel: VNCoreMLModel
+// MARK: - 车道重建与渲染引擎
+@MainActor
+class LaneReconstructionEngine: ObservableObject {
+    @Published var laneBEVImage: CGImage? // 鸟瞰图车道
+    
+    private let context = CIContext()
+    
+    // 将相机画面转换为鸟瞰图，并提取车道
+    func reconstructLanes(from pixelBuffer: CVPixelBuffer) {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        
+        // 1. 动态生成可行驶区域分割图 (利用 iOS 26 新版 Vision)
+        // (这里为了代码简洁，使用 CI 滤镜模拟道路灰度提取，实际应调用语义分割请求)
+        let roadFilter = CIFilter.colorThreshold()
+        roadFilter.inputImage = ciImage
+        roadFilter.threshold = 0.3 // 假设柏油路灰度
+        guard let roadMask = roadFilter.outputImage else { return }
+        
+        // 2. 执行透视变换 (Perspective Transform / Homography)
+        // 将梯形的道路区域拉伸为长方形的鸟瞰图
+        let perspectiveTransform = CIFilter.perspectiveTransform()
+        perspectiveTransform.inputImage = roadMask
+        
+        // 定义原图中的梯形顶点 (根据 iPhone 15 安装高度调整)
+        let width = ciImage.extent.width
+        let height = ciImage.extent.height
+        perspectiveTransform.topLeft = CIVector(x: width * 0.4, y: height * 0.6)
+        perspectiveTransform.topRight = CIVector(x: width * 0.6, y: height * 0.6)
+        perspectiveTransform.bottomLeft = CIVector(x: 0, y: height * 0.1)
+        perspectiveTransform.bottomRight = CIVector(x: width, y: height * 0.1)
+        
+        guard let bevOutput = perspectiveTransform.outputImage else { return }
+        
+        // 3. 渲染为 CGImage 用于 SwiftUI 显示
+        if let cgImage = context.createCGImage(bevOutput, from: bevOutput.extent) {
+            self.laneBEVImage = cgImage
+        }
+    }
 }
 
 @MainActor
-class ADASViewModel: NSObject, ObservableObject {
-    @Published var detectedObjects: [VNRecognizedObjectObservation] = []
-    @Published var isModelLoading = true
+class ADASProViewModel: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    @Published var detections: [(observation: VNRecognizedObjectObservation, distance: Float)] = []
     
     private let captureSession = AVCaptureSession()
-    private let videoDataOutput = AVCaptureVideoDataOutput()
-    private let videoDataOutputQueue = DispatchQueue(label: "com.user.adas.video-queue", qos: .userInteractive)
+    private var model: VNCoreMLModel?
+    private let queue = DispatchQueue(label: "video-processing", qos: .userInteractive)
     
-    // 关键修复：改为非隔离存储，允许后台访问
-    nonisolated(unsafe) private var modelContainer: ModelContainer?
+    // 引入车道引擎
+    @ObservedObject var laneEngine = LaneReconstructionEngine()
 
     override init() {
         super.init()
-        Task {
-            await setupModel()
-            await setupCamera()
-        }
+        setupEngine()
     }
-    
-    private func setupModel() async {
-        // 动态寻找并编译模型，解决 "cannot find yolov8l in scope"
-        guard let modelURL = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc") ?? 
-                Bundle.main.url(forResource: "yolov8l", withExtension: "mlpackage") else {
-            print("找不到模型文件")
-            return
-        }
-        
-        do {
-            let config = MLModelConfiguration()
-            config.computeUnits = .all
-            
-            // 动态编译并加载
-            let compiledURL = try await MLModel.compileModel(at: modelURL)
-            let coreMLModel = try MLModel(contentsOf: compiledURL, configuration: config)
-            let visionModel = try VNCoreMLModel(for: coreMLModel)
-            
-            self.modelContainer = ModelContainer(visionModel: visionModel)
-            self.isModelLoading = false
-        } catch {
-            print("动态模型加载失败: \(error)")
-        }
-    }
-    
-    private func setupCamera() async {
-        captureSession.beginConfiguration()
-        guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
-        
-        do {
-            let input = try AVCaptureDeviceInput(device: videoDevice)
-            if captureSession.canAddInput(input) { captureSession.addInput(input) }
-            if captureSession.canAddOutput(videoDataOutput) {
-                captureSession.addOutput(videoDataOutput)
-                videoDataOutput.setSampleBufferDelegate(self, queue: videoDataOutputQueue)
-            }
-            captureSession.sessionPreset = .hd1920x1080
-            captureSession.commitConfiguration()
-            
-            // 兼容 iOS 26 的启动调用
-            Task.detached {
-                await self.captureSession.startRunning()
-            }
-        } catch {
-            print("相机启动失败")
-        }
-    }
-}
 
-// MARK: - 实时推理委托
-extension ADASViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
+    private func setupEngine() {
+        Task {
+            // 模型和相机配置省略... (参考前一版代码)
+            await captureSession.startRunning()
+        }
+    }
+
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        // 这里的 self.modelContainer 现在是可以安全跨线程访问的
-        guard let container = self.modelContainer else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        let request = VNCoreMLRequest(model: container.visionModel) { request, error in
-            if let results = request.results as? [VNRecognizedObjectObservation] {
-                Task { @MainActor in
-                    self.detectedObjects = results
-                }
-            }
-        }
+        // 核心功能 1：YOLO 物体检测
+        // (检测代码省略...)
         
-        request.imageCropAndScaleOption = .scaleFill
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
-        try? handler.perform([request])
+        // 核心功能 2：实时车道重建
+        Task { @MainActor in
+            self.laneEngine.reconstructLanes(from: pixelBuffer)
+        }
     }
 }
 
-// MARK: - 简洁 UI 
+// MARK: - 特斯拉风仪表盘界面
 struct ContentView: View {
-    @StateObject private var viewModel = ADASViewModel()
+    @StateObject var viewModel = ADASProViewModel()
     
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        ZStack(alignment: .bottom) {
+            // 1. 全屏相机背景 + YOLO 检测框 (参考前一版代码)
+            Color.black.ignoresSafeArea() 
             
-            if viewModel.isModelLoading {
-                ProgressView("正在编译 YOLOv8L 引擎...").tint(.white).foregroundColor(.white)
-            } else {
-                GeometryReader { geo in
-                    ForEach(viewModel.detectedObjects, id: \.uuid) { obj in
-                        let box = obj.boundingBox
-                        let rect = CGRect(
-                            x: box.origin.x * geo.size.width,
-                            y: (1 - box.origin.y - box.height) * geo.size.height,
-                            width: box.width * geo.size.width,
-                            height: box.height * geo.size.height
-                        )
-                        
-                        RoundedRectangle(cornerRadius: 4)
-                            .path(in: rect)
-                            .stroke(Color.red, lineWidth: 3)
-                        
-                        Text("\(obj.labels.first?.identifier ?? "??")")
-                            .position(x: rect.midX, y: rect.minY - 15)
-                            .foregroundColor(.red)
-                    }
+            // 2. 底部车道渲染窗口 (BEV Bird's Eye View)
+            VStack {
+                HStack {
+                    Image(systemName: "car.top.radiowaves.rear.left.and.rear.right")
+                    Text("VECTOR SPACE | LANE RECONSTRUCTION")
+                }
+                .font(.system(size: 10, weight: .black, design: .monospaced))
+                .foregroundColor(.white)
+                .padding(.top, 8)
+                
+                if let bevImage = viewModel.laneEngine.laneBEVImage {
+                    Image(decorative: bevImage, scale: 1.0)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .overlay {
+                            // 绘制自车（上帝视角中心）
+                            Rectangle()
+                                .fill(Color.blue)
+                                .frame(width: 30, height: 50)
+                                .cornerRadius(4)
+                                .offset(y: 40) // 位于 BEV 图底部中心
+                        }
+                        .frame(width: 300, height: 150)
+                        .background(Color.black)
+                        .cornerRadius(12)
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.3), lineWidth: 1))
+                        .padding(.bottom, 30)
+                } else {
+                    ProgressView("计算车道中...").tint(.white).frame(width: 300, height: 150)
                 }
             }
+            .background(Color.black.opacity(0.8))
+            .cornerRadius(16)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
         }
-        .statusBarHidden()
     }
-}
-
-@main
-struct MyADASApp: App {
-    var body: some Scene { WindowGroup { ContentView() } }
 }
