@@ -1,4 +1,4 @@
-name: ADAS-Final-Build-v7
+name: ADAS-Final-Build-v8
 
 on: [push]
 
@@ -11,34 +11,32 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      - name: Build Project
+      - name: Pre-build Clean
         run: |
-          # 自动获取工程名
+          # 将模型暂时移出 Sources 目录，防止 Xcode 自动生成代码报错
+          mkdir -p ModelTemp
+          mv Sources/yolov8s.mlpackage ModelTemp/
+
+      - name: Build Binary
+        run: |
           SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
-          
-          # 执行归档打包，加入 COREML_CODEGEN_LANGUAGE=None 避开语言检测报错
           xcodebuild archive \
             -scheme "$SCHEME_NAME" \
             -destination 'generic/platform=iOS' \
             -archivePath ./build/MyADAS.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            COREML_CODEGEN_LANGUAGE=None
+            CODE_SIGNING_REQUIRED=NO
 
       - name: Industrial Manual Packaging
         run: |
-          # 1. 创建 App 结构
           mkdir -p MyADASApp.app
-          
-          # 2. 寻找并拷贝二进制执行文件
           BINARY_PATH=$(find ./build/MyADAS.xcarchive/Products -type f | grep "bin/" | head -n 1)
           cp "$BINARY_PATH" MyADASApp.app/MyADASApp
           
-          # 3. 编译 YOLO 模型
-          # xcrun 会将你的 .mlpackage 编译成 iOS 运行时真正需要的 .mlmodelc 文件夹
-          xcrun coremlc compile Sources/yolov8s.mlpackage MyADASApp.app/
+          # 手动编译之前移走的模型
+          xcrun coremlc compile ModelTemp/yolov8s.mlpackage MyADASApp.app/
           
-          # 4. 写入 Info.plist
+          # 生成 Info.plist
           cat <<EOF > MyADASApp.app/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -57,7 +55,6 @@ jobs:
           </plist>
           EOF
 
-          # 5. 封装成 IPA
           mkdir -p Payload
           cp -r MyADASApp.app Payload/
           zip -r MyADAS_Final.ipa Payload
