@@ -1,6 +1,7 @@
 import SwiftUI
 import Vision
 import AVFoundation
+import CoreML
 
 // MARK: - ADAS 核心逻辑控制器
 @MainActor
@@ -8,28 +9,28 @@ class ADASViewModel: NSObject, ObservableObject {
     @Published var detectedObjects: [VNRecognizedObjectObservation] = []
     @Published var isModelLoading = true
     
-    private var captureSession = AVCaptureSession()
-    private var videoDeviceInput: AVCaptureDeviceInput?
+    private let captureSession = AVCaptureSession()
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private let videoDataOutputQueue = DispatchQueue(label: "com.user.adas.video-queue", qos: .userInteractive)
     
+    // 关键修复：模型必须能够安全地在后台访问
     private var model: VNCoreMLModel?
 
     override init() {
         super.init()
         Task {
             await setupModel()
-            setupCamera()
+            await setupCamera()
         }
     }
     
-    // 加载刚刚上传的 yolov8l 模型
     private func setupModel() async {
         do {
-            // 注意：确保项目中模型文件名完全匹配 yolov8l
             let config = MLModelConfiguration()
-            config.computeUnits = .all // 强制开启 Neural Engine (ANE)
+            config.computeUnits = .all 
             
+            // 修复点 1：使用更稳健的方式实例化模型
+            // 如果你的文件名是 yolov8l.mlpackage，生成的类名通常是 yolov8l
             let coreMLModel = try yolov8l(configuration: config).model
             let visionModel = try VNCoreMLModel(for: coreMLModel)
             
@@ -40,10 +41,9 @@ class ADASViewModel: NSObject, ObservableObject {
         }
     }
     
-    private func setupCamera() {
+    private func setupCamera() async {
         captureSession.beginConfiguration()
         
-        // 获取后置摄像头
         guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
         
         do {
@@ -58,43 +58,47 @@ class ADASViewModel: NSObject, ObservableObject {
                 videoDataOutput.setSampleBufferDelegate(self, queue: videoDataOutputQueue)
             }
             
-            // 针对 2026 年的高清屏幕优化分辨率
             captureSession.sessionPreset = .hd1920x1080
             captureSession.commitConfiguration()
             
-            Task.detached {
-                self.captureSession.startRunning()
+            // 修复点 2：iOS 26 中 startRunning 必须异步调用且 await
+            if !captureSession.isRunning {
+                await captureSession.startRunning()
             }
         } catch {
             print("相机设置失败: \(error)")
         }
     }
+
+    // 内部辅助方法：允许后台线程更新 UI
+    fileprivate func updateDetections(_ observations: [VNRecognizedObjectObservation]) {
+        self.detectedObjects = observations
+    }
 }
 
-// MARK: - 实时推理委托
-extension ADASViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let model = model, !isModelLoading else { return }
+// MARK: - 实时推理委托 (适配 Swift 6 隔离规则)
+extension ADASViewModel: @preconcurrency AVCaptureVideoDataOutputSampleBufferDelegate {
+    
+    // 修复点 3：标记为 nonisolated，解决 Swift 6 的 Actor 隔离警告
+    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         
+        // 这里的逻辑在后台线程执行
+        guard let model = self.model else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
         let request = VNCoreMLRequest(model: model) { request, error in
             if let results = request.results as? [VNRecognizedObjectObservation] {
-                DispatchQueue.main.async {
-                    self.detectedObjects = results
+                // 修复点 4：从后台切回主线程更新 UI
+                Task { @MainActor in
+                    self.updateDetections(results)
                 }
             }
         }
         
-        // 保持推理方向与手机竖屏一致
         request.imageCropAndScaleOption = .scaleFill
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
         
-        do {
-            try handler.perform([request])
-        } catch {
-            print("推理失败: \(error)")
-        }
+        try? handler.perform([request])
     }
 }
 
@@ -104,19 +108,14 @@ struct ContentView: View {
     
     var body: some View {
         ZStack {
-            // 相机预览层（此处建议在实际工程中嵌入 UIViewRepresentable 的预览层）
             Color.black.ignoresSafeArea()
             
             if viewModel.isModelLoading {
                 VStack {
-                    ProgressView()
-                        .tint(.white)
-                    Text("正在加载 YOLOv8L 引擎...")
-                        .foregroundColor(.white)
-                        .padding()
+                    ProgressView().tint(.white)
+                    Text("载入 YOLOv8L 强力引擎...").foregroundColor(.white).padding()
                 }
             } else {
-                // 绘制检测框
                 GeometryReader { geometry in
                     ForEach(viewModel.detectedObjects, id: \.uuid) { obj in
                         let box = obj.boundingBox
@@ -127,29 +126,25 @@ struct ContentView: View {
                         
                         Rectangle()
                             .path(in: CGRect(x: x, y: y, width: width, height: height))
-                            .stroke(Color.green, lineWidth: 2)
+                            .stroke(Color.red, lineWidth: 2) // Large模型用红色，更显霸气
                         
                         if let label = obj.labels.first {
                             Text("\(label.identifier) \(Int(label.confidence * 100))%")
                                 .position(x: x + width/2, y: y - 10)
-                                .foregroundColor(.green)
-                                .font(.caption.bold())
+                                .foregroundColor(.red)
+                                .font(.system(size: 14, weight: .bold))
                         }
                     }
                 }
                 
-                // 状态指示器
                 VStack {
                     HStack {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 10, height: 10)
-                        Text("iOS 26 ADAS 实时监控 (YOLOv8L)")
-                            .font(.system(size: 12, weight: .black, design: .monospaced))
-                            .foregroundColor(.white)
+                        Image(systemName: "eye.fill")
+                        Text("iOS 26 ADAS PRO | YOLOv8L")
                     }
+                    .font(.caption.monospaced())
                     .padding(8)
-                    .background(Color.black.opacity(0.7))
+                    .background(.ultraThinMaterial)
                     .cornerRadius(8)
                     .padding(.top, 50)
                     Spacer()
@@ -160,7 +155,6 @@ struct ContentView: View {
     }
 }
 
-// MARK: - 程序入口
 @main
 struct MyADASApp: App {
     var body: some Scene {
