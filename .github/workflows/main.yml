@@ -1,4 +1,4 @@
-name: ADAS-Simple-Build-v3
+name: ADAS-Simple-Build-v4
 
 on: [push]
 
@@ -11,38 +11,38 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
-      - name: Build Unsigned App
+      - name: Build and Archive
         run: |
-          # 1. 自动获取 Scheme / Auto-detect Scheme
+          # 1. 自动获取 Scheme
           SCHEME_NAME=$(xcodebuild -list -json | jq -r '.workspace.schemes[0] // .project.schemes[0]')
           echo "Detected Scheme: $SCHEME_NAME"
           
-          # 2. 编译并动态生成 Info.plist / Build and auto-generate Info.plist
-          xcodebuild build \
+          # 2. 执行归档 (Archive)，这是生成真机包最稳妥的方式
+          # 使用 ALLOWED=NO 跳过签名，但生成完整的归档结构
+          xcodebuild archive \
             -scheme "$SCHEME_NAME" \
             -destination 'generic/platform=iOS' \
-            -configuration Release \
+            -archivePath ./build/MyADAS.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             GENERATE_INFOPLIST_FILE=YES \
-            INFOPLIST_KEY_NSCameraUsageDescription="我们需要使用摄像头来进行道路目标识别" \
-            INFOPLIST_KEY_UILaunchScreen_Generation=YES \
-            -derivedDataPath ./DerivedData
+            INFOPLIST_KEY_NSCameraUsageDescription="我们需要使用摄像头来进行道路目标识别"
 
-      - name: Create IPA Container
+      - name: Package IPA
         run: |
-          # 3. 在编译输出中深度搜索 .app 文件夹 / Search for .app bundle
-          APP_PATH=$(find ./DerivedData -name "*.app" | grep "Release-iphoneos" | head -n 1)
+          # 3. 定位归档内的 .app 文件夹
+          # 在 .xcarchive 结构中，app 路径是非常固定的
+          APP_PATH=$(find ./build/MyADAS.xcarchive/Products/Applications -name "*.app" | head -n 1)
           
           if [ -z "$APP_PATH" ]; then
-            echo "错误：未找到编译生成的 .app 文件！ / Error: .app file not found!"
-            find ./DerivedData -name "*.app"
+            echo "错误：归档中未找到 .app 文件！正在列出归档内容进行检查："
+            ls -R ./build/MyADAS.xcarchive
             exit 1
           fi
           
           echo "Found App at: $APP_PATH"
           
-          # 4. 封装 IPA / Package IPA
+          # 4. 封装成标准 IPA 格式
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
           zip -r MyADAS_Simple.ipa Payload
