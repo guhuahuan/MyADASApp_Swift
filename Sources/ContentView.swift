@@ -4,7 +4,7 @@ import AVFoundation
 import CoreMotion
 import CoreLocation
 
-// MARK: - 1. FSD 增强型数据结构
+// MARK: - 1. 数据结构定义
 struct FSDTrackedObject: Identifiable, Sendable {
     let id: UUID
     var label: String
@@ -19,11 +19,11 @@ struct SafeModelBuffer: @unchecked Sendable {
 }
 
 enum ADASCameraMode: Sendable {
-    case ultraWide // 城市模式
-    case telephoto // 高速模式
+    case ultraWide // 城市：超广角
+    case telephoto // 高速：主摄 ROI 裁切（模拟长焦）
 }
 
-// MARK: - 2. FSD 双摄联动引擎
+// MARK: - 2. 核心引擎
 @MainActor
 class DualCamFSDEngine: NSObject, ObservableObject {
     @Published var cameraMode: ADASCameraMode = .ultraWide
@@ -58,6 +58,7 @@ class DualCamFSDEngine: NSObject, ObservableObject {
         Task {
             let config = MLModelConfiguration()
             config.computeUnits = .all
+            // 请确保项目中已导入 yolov8l.mlmodelc
             if let url = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
                let mlModel = try? MLModel(contentsOf: url, configuration: config),
                let vModel = try? VNCoreMLModel(for: mlModel) {
@@ -76,7 +77,6 @@ class DualCamFSDEngine: NSObject, ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { capture.startRunning() }
     }
 
-    // 动态镜头切换核心逻辑
     func updateSystemSpeed(_ speed: Double) {
         self.currentSpeed = speed
         let targetMode: ADASCameraMode = speed > 65.0 ? .telephoto : .ultraWide
@@ -90,7 +90,7 @@ class DualCamFSDEngine: NSObject, ObservableObject {
         session.beginConfiguration()
         if let input = currentInput { session.removeInput(input) }
         
-        // 如果是高速模式，首选主摄(Wide)获取高像素以进行中心裁切，城市模式用超广角
+        // 高速用主摄(1x)配合ROI裁切，城市用超广角(0.5x)
         let deviceType: AVCaptureDevice.DeviceType = (mode == .telephoto) ? .builtInWideAngleCamera : .builtInUltraWideCamera
         
         guard let device = AVCaptureDevice.default(deviceType, for: .video, position: .back),
@@ -107,7 +107,7 @@ class DualCamFSDEngine: NSObject, ObservableObject {
     }
 }
 
-// MARK: - 3. 视觉处理与 ROI 动态调整
+// MARK: - 3. 视觉处理与多模式适配
 extension DualCamFSDEngine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
     
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
@@ -120,7 +120,8 @@ extension DualCamFSDEngine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLoca
         guard let pixel = CMSampleBufferGetImageBuffer(sampleBuffer),
               let container = self.safeModel else { return }
         
-        let mode = Task { @MainActor in self.cameraMode }
+        // 显式捕获 Task 句柄以供后续 await 访问
+        let modeTask = Task { @MainActor in self.cameraMode }
         
         let detReq = VNCoreMLRequest(model: container.model) { req, _ in
             if let results = req.results as? [VNRecognizedObjectObservation] {
@@ -128,10 +129,10 @@ extension DualCamFSDEngine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLoca
             }
         }
 
-        // 关键逻辑：如果是高速模式，强制 Vision 关注画面中心区域（虚拟长焦）
+        // 异步配置：高速模式下收缩 ROI（感兴趣区域）以实现虚拟长焦
         Task {
-            let currentMode = await mode
-            if currentMode == .telephoto {
+            let mode = await modeTask.value
+            if mode == .telephoto {
                 detReq.regionOfInterest = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
             }
         }
@@ -140,7 +141,8 @@ extension DualCamFSDEngine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLoca
         try? VNImageRequestHandler(cvPixelBuffer: pixel, orientation: .right).perform([segReq, detReq])
         
         if let maskObs = segReq.results?.first {
-            if let cgMask = try? self.context.createCGImage(CIImage(cvPixelBuffer: maskObs.instanceMask), from: CIImage(cvPixelBuffer: maskObs.instanceMask).extent) {
+            let maskCI = CIImage(cvPixelBuffer: maskObs.instanceMask)
+            if let cgMask = self.context.createCGImage(maskCI, from: maskCI.extent) {
                 Task { @MainActor in self.occupancyMask = cgMask }
             }
         }
@@ -156,24 +158,26 @@ extension DualCamFSDEngine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLoca
             let currentCenter = CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
             
             let prev = prevPositions[label] ?? currentCenter
-            let vector = CGVector(dx: (currentCenter.x - prev.x) * 20, dy: (currentCenter.y - prev.y) * 20)
+            let vector = CGVector(dx: (currentCenter.x - prev.x) * 25, dy: (currentCenter.y - prev.y) * 25)
             prevPositions[label] = currentCenter
             
+            // 测距算法
             let dist = 1.2 / (Float(obs.boundingBox.minY) + 0.05)
             
-            if dist < 6.0 {
-                if obs.boundingBox.midX < 0.25 { sideAlert = .leading }
-                if obs.boundingBox.midX > 0.75 { sideAlert = .trailing }
+            // 侧方盲区报警
+            if dist < 7.0 {
+                if obs.boundingBox.midX < 0.22 { sideAlert = .leading }
+                if obs.boundingBox.midX > 0.78 { sideAlert = .trailing }
             }
             
-            nextObjects.append(FSDTrackedObject(id: UUID(), label: label, distance: dist, velocityVector: vector, boundingBox: obs.boundingBox, isSideHazard: dist < 5.0))
+            nextObjects.append(FSDTrackedObject(id: UUID(), label: label, distance: dist, velocityVector: vector, boundingBox: obs.boundingBox, isSideHazard: dist < 6.0))
         }
         self.trackedObjects = nextObjects
         self.sideWarning = sideAlert
     }
 }
 
-// MARK: - 4. 终极 FSD 交互界面
+// MARK: - 4. 终极 UI 界面
 struct FSDUltimateView: View {
     @StateObject var engine = DualCamFSDEngine()
     
@@ -181,58 +185,62 @@ struct FSDUltimateView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             
-            // 占用网络预览
+            // 1. 占用网络预览 (Occupancy)
             if let mask = engine.occupancyMask {
                 Image(decorative: mask, scale: 1.0)
                     .resizable()
                     .renderingMode(.template)
-                    .foregroundColor(.cyan.opacity(0.3))
+                    .foregroundColor(.cyan.opacity(0.35))
                     .ignoresSafeArea()
             }
             
-            // 侧方流光报警
+            // 2. 特斯拉风格侧方流光预警 (Side Warnings)
             HStack {
                 Rectangle().fill(LinearGradient(colors: [.red.opacity(engine.sideWarning == .leading ? 0.8 : 0), .clear], startPoint: .leading, endPoint: .trailing))
-                    .frame(width: 70)
+                    .frame(width: 80)
                 Spacer()
                 Rectangle().fill(LinearGradient(colors: [.clear, .red.opacity(engine.sideWarning == .trailing ? 0.8 : 0)], startPoint: .leading, endPoint: .trailing))
-                    .frame(width: 70)
+                    .frame(width: 80)
             }.ignoresSafeArea()
             
+            // 3. 目标追踪与矢量线 (FSD Vectors)
             GeometryReader { geo in
                 ForEach(engine.trackedObjects) { obj in
                     let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
                     
-                    // 预测矢量线
+                    // 预测矢量线 (Yellow Predictive Path)
                     Path { p in
                         let start = CGPoint(x: rect.midX, y: geo.size.height - rect.minY)
                         p.move(to: start)
-                        p.addLine(to: CGPoint(x: start.x + obj.velocityVector.dx * 80, y: start.y - obj.velocityVector.dy * 80))
+                        p.addLine(to: CGPoint(x: start.x + obj.velocityVector.dx * 120, y: start.y - obj.velocityVector.dy * 120))
                     }
-                    .stroke(Color.yellow, style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
+                    .stroke(Color.yellow, style: StrokeStyle(lineWidth: 2.5, dash: [6, 4]))
                     
-                    // 特斯拉风格目标框
-                    RoundedRectangle(cornerRadius: 2)
-                        .stroke(obj.isSideHazard ? Color.red : Color.white, lineWidth: 1)
+                    // 目标框
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(obj.isSideHazard ? Color.red : Color.white, lineWidth: 1.5)
                         .frame(width: rect.width, height: rect.height)
                         .position(x: rect.midX, y: geo.size.height - rect.midY)
                 }
             }
             
-            // HUD 信息面板
+            // 4. HUD 仪表盘
             VStack {
-                HStack {
+                HStack(alignment: .top) {
                     VStack(alignment: .leading) {
-                        Text("\(Int(engine.currentSpeed))").font(.system(size: 40, weight: .black, design: .monospaced))
+                        Text("\(Int(engine.currentSpeed))")
+                            .font(.system(size: 50, weight: .black, design: .monospaced))
                         Text("KM/H").font(.caption).foregroundColor(.gray)
                     }
                     Spacer()
-                    Image(systemName: engine.cameraMode == .telephoto ? "scope" : "eye.circle")
-                        .foregroundColor(engine.cameraMode == .telephoto ? .yellow : .cyan)
-                    Text(engine.cameraMode == .telephoto ? "HIGH-SPEED (ROI FOCUS)" : "CITY (WIDE-ANGLE)")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    VStack(alignment: .trailing) {
+                        Image(systemName: engine.cameraMode == .telephoto ? "scope" : "eye.circle")
+                            .font(.title2)
+                        Text(engine.cameraMode == .telephoto ? "HIGH-SPEED FOCUS" : "CITY WIDE-ANGLE")
+                            .font(.system(size: 10, weight: .bold))
+                    }.foregroundColor(engine.cameraMode == .telephoto ? .yellow : .cyan)
                 }
-                .padding()
+                .padding(30)
                 .background(Color.black.opacity(0.4))
                 .foregroundColor(.white)
                 Spacer()
@@ -241,6 +249,7 @@ struct FSDUltimateView: View {
     }
 }
 
+// MARK: - 5. 程序入口
 @main
 struct ADASApp: App {
     var body: some Scene { WindowGroup { FSDUltimateView() } }
