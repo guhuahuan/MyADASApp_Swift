@@ -17,7 +17,6 @@ jobs:
 
       - name: Create Info.plist
         run: |
-          # 动态生成权限声明，这是 App 能在真机上运行并调用相机的“通行证”
           cat <<EOF > Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -39,13 +38,10 @@ jobs:
 
       - name: Build for iPhone Device
         run: |
-          # 1. 环境准备
           swift package clean
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "Targeting iOS SDK: $SDK_PATH"
           
-          # 2. 编译 iOS 纯二进制文件
-          # 注入 Info.plist 并锁定 arm64 架构
+          # 执行编译
           swift build -c release \
             --triple arm64-apple-ios17.0 \
             -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
@@ -55,31 +51,35 @@ jobs:
 
       - name: Package as IPA
         run: |
-          # 1. 构建 iOS App 目录结构
-          # iOS 应用本质上是一个以 .app 结尾的文件夹
-          APP_DIR="Payload/MyADASApp_Swift.app"
-          mkdir -p "$APP_DIR"
+          # 1. 创建目录结构
+          mkdir -p Payload/MyADASApp_Swift.app
           
-          # 2. 拷贝编译好的二进制文件到 App 根目录
-          # 路径指向 SPM 默认的 release 输出位置
-          cp .build/arm64-apple-ios17.0/release/MyADASApp_Swift "$APP_DIR/MyADASApp_Swift"
+          # 2. 动态搜索二进制文件 (解决路径找不到的问题)
+          # 我们在 .build 目录下寻找名为 MyADASApp_Swift 的文件，且路径中包含 release
+          BINARY_PATH=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
+          echo "Found binary at: $BINARY_PATH"
           
-          # 3. 拷贝 Info.plist (必须存在)
-          cp Info.plist "$APP_DIR/Info.plist"
+          if [ -z "$BINARY_PATH" ]; then
+            echo "Error: Could not find the compiled binary."
+            exit 1
+          fi
           
-          # 4. 拷贝编译后的 CoreML 资源
-          # SPM 会把 .mlpackage 预编译成 .mlmodelc 文件夹，我们需要递归拷贝
+          cp "$BINARY_PATH" Payload/MyADASApp_Swift.app/MyADASApp_Swift
+          chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
+          
+          # 3. 拷贝权限文件
+          cp Info.plist Payload/MyADASApp_Swift.app/Info.plist
+          
+          # 4. 拷贝 AI 模型 (同样的动态搜索逻辑)
           echo "Searching for compiled models..."
-          find .build -name "*.mlmodelc" -exec cp -r {} "$APP_DIR/" \;
+          find .build -name "*.mlmodelc" -exec cp -r {} Payload/MyADASApp_Swift.app/ \;
           
-          # 5. 执行打包过程
-          # zip 压缩后并重命名为 .ipa，这是安装工具识别的标准格式
+          # 5. 打包
           zip -r MyADASApp_Swift.ipa Payload
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FSD-ADAS-Package
-          # 这里的路径必须与上面生成的 zip 文件名完全一致
           path: MyADASApp_Swift.ipa
           if-no-files-found: error
