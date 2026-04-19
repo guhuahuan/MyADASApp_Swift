@@ -12,7 +12,6 @@ let package = Package(
             name: "MyADASApp_Swift",
             path: "Sources",
             resources: [
-                // 仅保留 yolov8l，请确保 Sources 文件夹下确实有这个文件夹
                 .process("yolov8l.mlpackage")
             ]
         )
