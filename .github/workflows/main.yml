@@ -13,7 +13,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set Xcode Version
-        # 强制切换到 Xcode 15.4 环境
         run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
       - name: Create Info.plist
@@ -40,16 +39,14 @@ jobs:
           swift package clean
           
           # 2. 获取 iOS SDK 路径
-          export SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "Using iOS SDK: $SDK_PATH"
           
-          # 3. 强制锁定 iOS 编译环境
-          # 注意：添加了 -Xswiftc -isysroot 确保它不去找 Mac 的库
+          # 3. 执行编译
+          # 使用 -Xswiftc 传递参数，并利用双引号确保路径中的空格被正确处理
           swift build -c release \
             --triple arm64-apple-ios17.0 \
             -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
-            -Xswiftc -isysroot -Xswiftc "$SDK_PATH" \
-            -Xswiftc -target -Xswiftc arm64-apple-ios17.0 \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
             
       - name: Upload Artifact
