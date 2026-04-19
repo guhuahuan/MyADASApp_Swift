@@ -12,6 +12,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Set Xcode Version
+        # 强制切换到 Xcode 15.4 环境
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
       - name: Create Info.plist
         run: |
           cat <<EOF > Info.plist
@@ -35,14 +39,16 @@ jobs:
           # 1. 清理旧缓存
           swift package clean
           
-          # 2. 动态获取 iOS 真机 SDK 路径 (关键修复：去掉反斜杠)
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "Using SDK: $SDK_PATH"
+          # 2. 获取 iOS SDK 路径
+          export SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Using iOS SDK: $SDK_PATH"
           
-          # 3. 强制锁定 arm64-apple-ios 架构编译
+          # 3. 强制锁定 iOS 编译环境
+          # 注意：添加了 -Xswiftc -isysroot 确保它不去找 Mac 的库
           swift build -c release \
             --triple arm64-apple-ios17.0 \
             -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
+            -Xswiftc -isysroot -Xswiftc "$SDK_PATH" \
             -Xswiftc -target -Xswiftc arm64-apple-ios17.0 \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
             
