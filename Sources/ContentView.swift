@@ -6,7 +6,7 @@ import CoreLocation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
-// MARK: - 1. 核心数据结构
+// MARK: - 1. 数据结构
 struct FSDV3Object: Identifiable, Sendable {
     let id: UUID
     var label: String
@@ -26,10 +26,9 @@ enum ADASCameraMode: String, Sendable {
     case telephoto = "HIGHWAY: FOCUS (1x + ROI)"
 }
 
-// MARK: - 2. FSD V3 旗舰引擎
+// MARK: - 2. 旗舰版引擎 (修复并发隔离)
 @MainActor
 class FSDV3Engine: NSObject, ObservableObject {
-    // UI 驱动属性
     @Published var cameraMode: ADASCameraMode = .ultraWide
     @Published var trackedObjects: [FSDV3Object] = []
     @Published var occupancyMask: CGImage?
@@ -38,25 +37,22 @@ class FSDV3Engine: NSObject, ObservableObject {
     @Published var speedLimit: Int = 0
     @Published var isNightMode: Bool = false
     
-    // Zen Path & IMU 属性
+    // Zen Path 动力学属性
     @Published var yawRate: Double = 0.0
     @Published var autoPitch: Double = 0.0
     
-    // 硬件与计算
     private let session = AVCaptureSession()
-    private let queue = DispatchQueue(label: "com.fsd.v3.queue", qos: .userInteractive)
-    nonisolated(unsafe) private let ciContext = CIContext()
-    private let motion = CMMotionManager()
+    private let queue = DispatchQueue(label: "com.fsd.v3.compute", qos: .userInteractive)
+    
+    // 标记为 nonisolated(unsafe) 以允许在后台线程进行图像渲染和传感器读写
+    nonisolated(unsafe) private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    nonisolated(unsafe) private let motion = CMMotionManager()
     private let locationManager = CLLocationManager()
     private let haptic = UIImpactFeedbackGenerator(style: .heavy)
     
     nonisolated(unsafe) private var safeModel: SafeModelBufferV3?
-    private var prevPositions: [String: CGPoint] = [:]
+    nonisolated(unsafe) private var prevPositions: [String: CGPoint] = [:]
     private var currentInput: AVCaptureDeviceInput?
-    
-    // 图像增强滤镜
-    nonisolated(unsafe) private let colorFilter = CIFilter.colorControls()
-    nonisolated(unsafe) private let exposureFilter = CIFilter.exposureAdjust()
 
     override init() {
         super.init()
@@ -76,7 +72,7 @@ class FSDV3Engine: NSObject, ObservableObject {
             motion.deviceMotionUpdateInterval = 1/60
             motion.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
                 guard let data = data, let self = self else { return }
-                // Pitch: 修正地平线 | YawRate: 驱动 3D 路径弯曲
+                // 主线程更新 UI 属性
                 self.autoPitch = 0.05 * data.attitude.pitch + 0.95 * self.autoPitch
                 self.yawRate = 0.15 * data.rotationRate.z + 0.85 * self.yawRate
             }
@@ -95,28 +91,39 @@ class FSDV3Engine: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - 夜视增强 (Night Vision)
-    private func applyNightVision(to image: CIImage) -> CIImage {
+    // MARK: - 夜视增强 (标记为 nonisolated 以修复 Actor 报错)
+    nonisolated private func applyNightVision(to image: CIImage) -> CIImage {
         let extent = image.extent
-        guard let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [kCIInputImageKey: image, kCIInputExtentKey: CIVector(cgRect: extent)])?.outputImage else { return image }
+        let vector = CIVector(cgRect: extent)
+        
+        guard let avgFilter = CIFilter(name: "CIAreaAverage", 
+                                       parameters: [kCIInputImageKey: image, kCIInputExtentKey: vector])?.outputImage else { 
+            return image 
+        }
         
         var bitmap = [UInt8](repeating: 0, count: 4)
         ciContext.render(avgFilter, toBitmap: &bitmap, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: nil)
         
         let luminance = Float(bitmap[0]) / 255.0
-        Task { @MainActor in self.isNightMode = luminance < 0.35 }
+        
+        // 异步更新主线程状态
+        Task { @MainActor in
+            self.isNightMode = luminance < 0.35
+        }
         
         if luminance < 0.35 {
-            exposureFilter.inputImage = image
-            exposureFilter.ev = 1.3
-            colorFilter.inputImage = exposureFilter.outputImage
-            colorFilter.contrast = 1.2
-            return colorFilter.outputImage ?? image
+            let exp = CIFilter.exposureAdjust()
+            exp.inputImage = image
+            exp.ev = 1.3
+            
+            let color = CIFilter.colorControls()
+            color.inputImage = exp.outputImage
+            color.contrast = 1.25
+            return color.outputImage ?? image
         }
         return image
     }
 
-    // MARK: - 硬件联动
     private func setupCamera() {
         switchCamera(to: .ultraWide)
         let output = AVCaptureVideoDataOutput()
@@ -153,7 +160,7 @@ class FSDV3Engine: NSObject, ObservableObject {
     }
 }
 
-// MARK: - 3. 核心算法流
+// MARK: - 3. 并发算法流
 extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
     
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
@@ -166,11 +173,11 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
         guard let pixel = CMSampleBufferGetImageBuffer(sampleBuffer),
               let container = self.safeModel else { return }
         
-        let modeTask = Task { @MainActor in self.cameraMode }
         let rawCI = CIImage(cvPixelBuffer: pixel)
+        // 1. 调用 nonisolated 方法，不再报错
         let processedCI = applyNightVision(to: rawCI)
         
-        // OCR 识别
+        // 2. 准备检测请求
         let ocrReq = VNRecognizeTextRequest { req, _ in
             if let results = req.results as? [VNRecognizedTextObservation] {
                 Task { @MainActor in
@@ -183,20 +190,18 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
             }
         }
 
-        // FSD 检测与 ROI 裁切
         let detReq = VNCoreMLRequest(model: container.detModel) { req, _ in
             if let results = req.results as? [VNRecognizedObjectObservation] {
                 Task { @MainActor in self.analyzeWorld(results) }
             }
         }
         
-        Task {
-            if await modeTask.value == .telephoto {
-                detReq.regionOfInterest = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
-            }
+        // 处理相机模式切换的隔离
+        let currentMode = DispatchQueue.main.sync { self.cameraMode }
+        if currentMode == .telephoto {
+            detReq.regionOfInterest = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
         }
 
-        // 占用网络
         let segReq = VNGenerateForegroundInstanceMaskRequest()
         
         try? VNImageRequestHandler(ciImage: processedCI, orientation: .right).perform([ocrReq, detReq, segReq])
@@ -235,7 +240,7 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
     }
 }
 
-// MARK: - 4. 终极 UI 界面 (Zen Path 版)
+// MARK: - 4. 最终 UI 布局 (Tesla 风格集成)
 struct FSDMasterViewV3: View {
     @StateObject var engine = FSDV3Engine()
     
@@ -243,7 +248,7 @@ struct FSDMasterViewV3: View {
         ZStack {
             Color.black.ignoresSafeArea()
             
-            // 4.1 占用网络 (蓝格底座)
+            // 4.1 占用网络网格
             if let mask = engine.occupancyMask {
                 Image(decorative: mask, scale: 1.0)
                     .resizable()
@@ -252,7 +257,7 @@ struct FSDMasterViewV3: View {
                     .ignoresSafeArea()
             }
             
-            // 4.2 3D Zen Path (3D 路径规划线条)
+            // 4.2 3D Zen Path (3D 路径规划)
             GeometryReader { geo in
                 Path { path in
                     let w = geo.size.width
@@ -274,29 +279,26 @@ struct FSDMasterViewV3: View {
                 .blur(radius: 12)
                 .blendMode(.screen)
                 .opacity(engine.currentSpeed > 5 ? 0.65 : 0)
-                .animation(.interactiveSpring(), value: engine.yawRate)
             }
 
-            // 4.3 侧方流光报警
+            // 4.3 侧方流光报警器
             HStack {
                 Rectangle().fill(LinearGradient(colors: [.red.opacity(engine.sideWarning == .leading ? 0.8 : 0), .clear], startPoint: .leading, endPoint: .trailing)).frame(width: 85)
                 Spacer()
                 Rectangle().fill(LinearGradient(colors: [.clear, .red.opacity(engine.sideWarning == .trailing ? 0.8 : 0)], startPoint: .leading, endPoint: .trailing)).frame(width: 85)
             }.ignoresSafeArea()
             
-            // 4.4 目标框与矢量预测
+            // 4.4 动态目标标注
             GeometryReader { geo in
                 ForEach(engine.trackedObjects) { obj in
                     let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
                     
-                    // 预测虚线
                     Path { p in
                         let start = CGPoint(x: rect.midX, y: geo.size.height - rect.minY)
                         p.move(to: start)
                         p.addLine(to: CGPoint(x: start.x + obj.velocityVector.dx * 100, y: start.y - obj.velocityVector.dy * 150))
                     }.stroke(Color.yellow, style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
                     
-                    // 动态着色框
                     RoundedRectangle(cornerRadius: 2)
                         .stroke(obj.isCritical ? Color.red : (obj.isSideHazard ? Color.orange : Color.white), lineWidth: 1.5)
                         .frame(width: rect.width, height: rect.height)
@@ -304,7 +306,7 @@ struct FSDMasterViewV3: View {
                 }
             }
             
-            // 4.5 HUD 控制面板
+            // 4.5 仪表盘与状态
             VStack {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading) {
@@ -329,9 +331,4 @@ struct FSDMasterViewV3: View {
             }
         }
     }
-}
-
-@main
-struct ADASFinalApp: App {
-    var body: some Scene { WindowGroup { FSDMasterViewV3() } }
 }
