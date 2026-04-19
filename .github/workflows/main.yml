@@ -17,6 +17,7 @@ jobs:
 
       - name: Create Info.plist
         run: |
+          # 动态生成权限声明，这是 App 能在真机上运行并调用相机的“通行证”
           cat <<EOF > Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -28,6 +29,9 @@ jobs:
               <key>CFBundleExecutable</key><string>MyADASApp_Swift</string>
               <key>CFBundleIdentifier</key><string>com.fsd.v4.adas</string>
               <key>CFBundleName</key><string>FSD V4 ADAS</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>4.0</string>
+              <key>CFBundleVersion</key><string>1</string>
               <key>UILaunchScreen</key><dict/>
           </dict>
           </plist>
@@ -35,24 +39,47 @@ jobs:
 
       - name: Build for iPhone Device
         run: |
-          # 1. 彻底清理缓存
+          # 1. 环境准备
           swift package clean
-          
-          # 2. 获取 SDK 路径，但不使用 export，避免污染 Package.swift 的解析环境
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "Compiling with SDK: $SDK_PATH"
+          echo "Targeting iOS SDK: $SDK_PATH"
           
-          # 3. 核心修正：仅在编译命令中注入参数
-          # 注意：去掉了 export SDKROOT，改回在 swift build 命令中精准注入
+          # 2. 编译 iOS 纯二进制文件
+          # 注入 Info.plist 并锁定 arm64 架构
           swift build -c release \
             --triple arm64-apple-ios17.0 \
             -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
             -Xcc -isysroot -Xcc "$SDK_PATH" \
             -Xcc --target=arm64-apple-ios17.0 \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
-            
+
+      - name: Package as IPA
+        run: |
+          # 1. 构建 iOS App 目录结构
+          # iOS 应用本质上是一个以 .app 结尾的文件夹
+          APP_DIR="Payload/MyADASApp_Swift.app"
+          mkdir -p "$APP_DIR"
+          
+          # 2. 拷贝编译好的二进制文件到 App 根目录
+          # 路径指向 SPM 默认的 release 输出位置
+          cp .build/arm64-apple-ios17.0/release/MyADASApp_Swift "$APP_DIR/MyADASApp_Swift"
+          
+          # 3. 拷贝 Info.plist (必须存在)
+          cp Info.plist "$APP_DIR/Info.plist"
+          
+          # 4. 拷贝编译后的 CoreML 资源
+          # SPM 会把 .mlpackage 预编译成 .mlmodelc 文件夹，我们需要递归拷贝
+          echo "Searching for compiled models..."
+          find .build -name "*.mlmodelc" -exec cp -r {} "$APP_DIR/" \;
+          
+          # 5. 执行打包过程
+          # zip 压缩后并重命名为 .ipa，这是安装工具识别的标准格式
+          zip -r MyADASApp_Swift.ipa Payload
+          
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FSD-ADAS-Binary
-          path: .build/arm64-apple-ios17.0/release/MyADASApp_Swift
+          name: FSD-ADAS-Package
+          # 这里的路径必须与上面生成的 zip 文件名完全一致
+          path: MyADASApp_Swift.ipa
+          if-no-files-found: error
