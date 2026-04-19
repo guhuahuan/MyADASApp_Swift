@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(
@@ -10,10 +10,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "MyADASApp_Swift",
-            path: "Sources",
-            swiftSettings: [
-                .unsafeFlags(["-sdk", "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk", "-target", "arm64-apple-ios17.0-simulator"])
-            ]
+            path: "Sources" // 确保你的 ContentView.swift 在 Sources 文件夹里
         )
     ]
 )
