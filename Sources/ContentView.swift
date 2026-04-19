@@ -6,7 +6,7 @@ import CoreLocation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
-// MARK: - 1. 数据结构
+// MARK: - 1. 数据模型 (Sendable)
 struct FSDV3Object: Identifiable, Sendable {
     let id: UUID
     var label: String
@@ -26,7 +26,7 @@ enum ADASCameraMode: String, Sendable {
     case telephoto = "HIGHWAY: FOCUS (1x + ROI)"
 }
 
-// MARK: - 2. 旗舰版引擎 (修复并发隔离)
+// MARK: - 2. FSD V3 旗舰引擎
 @MainActor
 class FSDV3Engine: NSObject, ObservableObject {
     @Published var cameraMode: ADASCameraMode = .ultraWide
@@ -37,14 +37,14 @@ class FSDV3Engine: NSObject, ObservableObject {
     @Published var speedLimit: Int = 0
     @Published var isNightMode: Bool = false
     
-    // Zen Path 动力学属性
+    // Zen Path 动画属性
     @Published var yawRate: Double = 0.0
     @Published var autoPitch: Double = 0.0
     
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.fsd.v3.compute", qos: .userInteractive)
     
-    // 标记为 nonisolated(unsafe) 以允许在后台线程进行图像渲染和传感器读写
+    // 允许跨线程渲染的组件
     nonisolated(unsafe) private let ciContext = CIContext(options: [.cacheIntermediates: false])
     nonisolated(unsafe) private let motion = CMMotionManager()
     private let locationManager = CLLocationManager()
@@ -62,7 +62,7 @@ class FSDV3Engine: NSObject, ObservableObject {
         haptic.prepare()
     }
 
-    // MARK: - 传感器逻辑
+    // MARK: - 传感器
     private func setupSensors() {
         locationManager.delegate = self
         locationManager.requestWhenInUseAuthorization()
@@ -72,7 +72,7 @@ class FSDV3Engine: NSObject, ObservableObject {
             motion.deviceMotionUpdateInterval = 1/60
             motion.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
                 guard let data = data, let self = self else { return }
-                // 主线程更新 UI 属性
+                // IMU 驱动路径弯曲
                 self.autoPitch = 0.05 * data.attitude.pitch + 0.95 * self.autoPitch
                 self.yawRate = 0.15 * data.rotationRate.z + 0.85 * self.yawRate
             }
@@ -91,7 +91,7 @@ class FSDV3Engine: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - 夜视增强 (标记为 nonisolated 以修复 Actor 报错)
+    // MARK: - 并发安全的夜视增强 (修复 Actor 报错)
     nonisolated private func applyNightVision(to image: CIImage) -> CIImage {
         let extent = image.extent
         let vector = CIVector(cgRect: extent)
@@ -106,7 +106,6 @@ class FSDV3Engine: NSObject, ObservableObject {
         
         let luminance = Float(bitmap[0]) / 255.0
         
-        // 异步更新主线程状态
         Task { @MainActor in
             self.isNightMode = luminance < 0.35
         }
@@ -160,7 +159,7 @@ class FSDV3Engine: NSObject, ObservableObject {
     }
 }
 
-// MARK: - 3. 并发算法流
+// MARK: - 3. 并发算法实现
 extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
     
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
@@ -174,10 +173,9 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
               let container = self.safeModel else { return }
         
         let rawCI = CIImage(cvPixelBuffer: pixel)
-        // 1. 调用 nonisolated 方法，不再报错
         let processedCI = applyNightVision(to: rawCI)
         
-        // 2. 准备检测请求
+        // OCR 请求
         let ocrReq = VNRecognizeTextRequest { req, _ in
             if let results = req.results as? [VNRecognizedTextObservation] {
                 Task { @MainActor in
@@ -190,13 +188,14 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
             }
         }
 
+        // YOLO 检测
         let detReq = VNCoreMLRequest(model: container.detModel) { req, _ in
             if let results = req.results as? [VNRecognizedObjectObservation] {
                 Task { @MainActor in self.analyzeWorld(results) }
             }
         }
         
-        // 处理相机模式切换的隔离
+        // 通过 DispatchQueue 获取状态，避免直接在后台访问 Actor 属性
         let currentMode = DispatchQueue.main.sync { self.cameraMode }
         if currentMode == .telephoto {
             detReq.regionOfInterest = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
@@ -240,7 +239,7 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
     }
 }
 
-// MARK: - 4. 最终 UI 布局 (Tesla 风格集成)
+// MARK: - 4. 终端 UI 界面
 struct FSDMasterViewV3: View {
     @StateObject var engine = FSDV3Engine()
     
@@ -257,7 +256,7 @@ struct FSDMasterViewV3: View {
                     .ignoresSafeArea()
             }
             
-            // 4.2 3D Zen Path (3D 路径规划)
+            // 4.2 3D Zen Path (Tesla 风格路径规划)
             GeometryReader { geo in
                 Path { path in
                     let w = geo.size.width
@@ -281,14 +280,14 @@ struct FSDMasterViewV3: View {
                 .opacity(engine.currentSpeed > 5 ? 0.65 : 0)
             }
 
-            // 4.3 侧方流光报警器
+            // 4.3 侧方危险流光
             HStack {
                 Rectangle().fill(LinearGradient(colors: [.red.opacity(engine.sideWarning == .leading ? 0.8 : 0), .clear], startPoint: .leading, endPoint: .trailing)).frame(width: 85)
                 Spacer()
                 Rectangle().fill(LinearGradient(colors: [.clear, .red.opacity(engine.sideWarning == .trailing ? 0.8 : 0)], startPoint: .leading, endPoint: .trailing)).frame(width: 85)
             }.ignoresSafeArea()
             
-            // 4.4 动态目标标注
+            // 4.4 动态目标识别框
             GeometryReader { geo in
                 ForEach(engine.trackedObjects) { obj in
                     let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
@@ -306,7 +305,7 @@ struct FSDMasterViewV3: View {
                 }
             }
             
-            // 4.5 仪表盘与状态
+            // 4.5 HUD 状态栏
             VStack {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading) {
@@ -329,6 +328,16 @@ struct FSDMasterViewV3: View {
                 .padding(30).background(Color.black.opacity(0.4)).foregroundColor(.white)
                 Spacer()
             }
+        }
+    }
+}
+
+// MARK: - 5. App 启动入口 (修复 Linker _main 报错)
+@main
+struct ADASFinalApp: App {
+    var body: some Scene {
+        WindowGroup {
+            FSDMasterViewV3()
         }
     }
 }
