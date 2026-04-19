@@ -3,6 +3,8 @@ name: Build FSD V4 ADAS
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
   build:
@@ -12,27 +14,48 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Info.plist
+      - name: Create Info.plist
         run: |
-          # 创建权限声明文件
-          echo '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>
-            <key>NSCameraUsageDescription</key><string>AI识别路况</string>
-            <key>NSLocationWhenInUseUsageDescription</key><string>计算车速</string>
-            <key>NSMotionUsageDescription</key><string>路径姿态修正</string>
-          </dict></plist>' > Info.plist
+          # 自动生成包含隐私权限声明的 Info.plist
+          cat <<EOF > Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>NSCameraUsageDescription</key>
+              <string>FSD视觉引擎需要访问相机以进行路况识别</string>
+              <key>NSLocationWhenInUseUsageDescription</key>
+              <string>计算车速并动态调整检测焦距</string>
+              <key>NSMotionUsageDescription</key>
+              <string>用于3D路径的姿态感应与实时修正</string>
+              <key>CFBundleExecutable</key>
+              <string>MyADASApp_Swift</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.fsd.v4.adas</string>
+              <key>CFBundleName</key>
+              <string>FSD V4 ADAS</string>
+          </dict>
+          </plist>
+          EOF
 
-      - name: Build for Real iPhone
+      - name: Build for iOS Device
         run: |
-          # 动态获取真机 SDK 路径
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          # 1. 清理旧缓存
+          swift package clean
           
-          # 核心构建命令：指向真机 arm64 架构，并注入权限
-          swift build -c release --triple arm64-apple-ios17.0 \
-            -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
+          # 2. 动态获取 iOS 真机 SDK 路径
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Using SDK at: \$SDK_PATH"
+          
+          # 3. 强制指定 arm64-apple-ios 目标，并链接 Info.plist
+          swift build -c release \
+            --triple arm64-apple-ios17.0 \
+            -Xswiftc -sdk -Xswiftc "\$SDK_PATH" \
+            -Xswiftc -target -Xswiftc arm64-apple-ios17.0 \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
             
-      - name: Upload Binary
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FSD-ADAS-Binary
+          name: FSD-V4-Binary
           path: .build/arm64-apple-ios17.0/release/MyADASApp_Swift
