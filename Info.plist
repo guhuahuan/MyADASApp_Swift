@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSCameraUsageDescription</key>
+    <string>FSD 视觉引擎需要访问相机以进行实时的 YOLO 目标检测与占用网络分析。</string>
+    
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>系统需要获取 GPS 信号以计算当前车速 (KM/H) 并动态切换摄像头焦距。</string>
+    
+    <key>NSMotionUsageDescription</key>
+    <string>Zen Path 需要访问设备陀螺仪，以实时计算车辆偏航率 (Yaw Rate) 和俯仰角 (Pitch)。</string>
+</dict>
+</plist>
