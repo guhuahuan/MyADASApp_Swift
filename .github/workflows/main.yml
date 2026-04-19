@@ -1,80 +1,53 @@
-name: Build MyADASApp (iOS 26 Final Strike)
+name: Build FSD V3 ADAS
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
 
 jobs:
   build:
-    runs-on: macos-15
-    
+    runs-on: macos-14 # 使用包含 Xcode 15/16 的最新 macOS 环境
+
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
-
-      - name: Hardcore Compilation
+      - name: Setup Permissions (Info.plist Injection)
         run: |
+          # 如果文件不存在，先创建一个基础的 Plist
+          if [ ! -f Info.plist ]; then
+            echo '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict></dict></plist>' > Info.plist
+          fi
+          
+          # 使用 PlistBuddy 注入隐私权限描述
+          /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string 'FSD视觉引擎需要访问相机以进行路况识别'" Info.plist || \
+          /usr/libexec/PlistBuddy -c "Set :NSCameraUsageDescription 'FSD视觉引擎需要访问相机以进行路况识别'" Info.plist
+          
+          /usr/libexec/PlistBuddy -c "Add :NSLocationWhenInUseUsageDescription string '计算车速并动态调整检测焦距'" Info.plist || \
+          /usr/libexec/PlistBuddy -c "Set :NSLocationWhenInUseUsageDescription '计算车速并动态调整检测焦距'" Info.plist
+          
+          /usr/libexec/PlistBuddy -c "Add :NSMotionUsageDescription string '用于3D路径的姿态感应与实时修正'" Info.plist || \
+          /usr/libexec/PlistBuddy -c "Set :NSMotionUsageDescription '用于3D路径的姿态感应与实时修正'" Info.plist
+          
+          echo "✅ 权限注入完成"
+
+      - name: Set Xcode Version
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app # 或者根据环境选择 16.0
+
+      - name: Build for iOS
+        run: |
+          # 获取 SDK 路径
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 核心修复：加上 -parse-as-library 参数
-          # 并且显式链接所有必要的框架
-          swiftc -o MyADASApp_Binary \
-            -target arm64-apple-ios17.0 \
-            -sdk "$SDK_PATH" \
-            -parse-as-library \
-            Sources/*.swift \
-            -O -whole-module-optimization \
-            -framework SwiftUI \
-            -framework Vision \
-            -framework AVFoundation \
-            -framework CoreML
-
-      - name: Assemble .app for TrollStore
-        run: |
-          mkdir -p MyADASApp.app
-          mv MyADASApp_Binary MyADASApp.app/MyADASApp
-          chmod +x MyADASApp.app/MyADASApp
-          
-          cat <<EOF > MyADASApp.app/Info.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>MyADASApp</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.user.MyADASApp</string>
-              <key>CFBundleName</key>
-              <string>MyADASApp</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>CFBundleShortVersionString</key>
-              <string>1.0</string>
-              <key>LSRequiresIPhoneOS</key>
-              <true/>
-              <key>MinimumOSVersion</key>
-              <string>17.0</string>
-              <key>UILaunchScreen</key>
-              <dict/>
-          </dict>
-          </plist>
-          EOF
-          
-          # 拷贝模型文件
-          cp -r Sources/yolov8s.mlpackage MyADASApp.app/
-
-      - name: Final Zip to IPA
-        run: |
-          mkdir -p Payload
-          cp -r MyADASApp.app Payload/
-          zip -vr MyADASApp.ipa Payload/
-          
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MyADASApp-iOS26-Ready
-          path: MyADASApp.ipa
+          # 执行编译
+          # 注意：这里我们强制将 Info.plist 链接进二进制
+          xcodebuild build \
+            -project *.xcodeproj \
+            -scheme YourAppSchemeName \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            INFOPLIST_FILE=Info.plist \
+            GENERATE_INFOPLIST=NO
