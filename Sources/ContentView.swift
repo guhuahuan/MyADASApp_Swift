@@ -1,12 +1,12 @@
-@preconcurrency import SwiftUI
-@preconcurrency import Vision
+import SwiftUI
+import Vision
 import AVFoundation
 import CoreMotion
 import CoreLocation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
-// MARK: - 1. 数据模型 (Sendable)
+// MARK: - 数据结构
 struct FSDV3Object: Identifiable, Sendable {
     let id: UUID
     var label: String
@@ -17,16 +17,12 @@ struct FSDV3Object: Identifiable, Sendable {
     var isCritical: Bool
 }
 
-struct SafeModelBufferV3: @unchecked Sendable {
-    let detModel: VNCoreMLModel
-}
-
 enum ADASCameraMode: String, Sendable {
     case ultraWide = "CITY: WIDE-ANGLE (0.5x)"
     case telephoto = "HIGHWAY: FOCUS (1x + ROI)"
 }
 
-// MARK: - 2. FSD V3 旗舰引擎
+// MARK: - 视觉引擎
 @MainActor
 class FSDV3Engine: NSObject, ObservableObject {
     @Published var cameraMode: ADASCameraMode = .ultraWide
@@ -36,21 +32,21 @@ class FSDV3Engine: NSObject, ObservableObject {
     @Published var currentSpeed: Double = 0.0
     @Published var speedLimit: Int = 0
     @Published var isNightMode: Bool = false
-    
-    // Zen Path 动画属性
     @Published var yawRate: Double = 0.0
     @Published var autoPitch: Double = 0.0
     
-    private let session = AVCaptureSession()
-    private let queue = DispatchQueue(label: "com.fsd.v3.compute", qos: .userInteractive)
+    // 关键：Swift 6 并发优化。internalMode 用于后台线程无锁读取
+    nonisolated(unsafe) private var internalMode: ADASCameraMode = .ultraWide
     
-    // 允许跨线程渲染的组件
+    private let session = AVCaptureSession()
+    private let queue = DispatchQueue(label: "com.fsd.v4.compute", qos: .userInteractive)
+    
     nonisolated(unsafe) private let ciContext = CIContext(options: [.cacheIntermediates: false])
     nonisolated(unsafe) private let motion = CMMotionManager()
     private let locationManager = CLLocationManager()
     private let haptic = UIImpactFeedbackGenerator(style: .heavy)
     
-    nonisolated(unsafe) private var safeModel: SafeModelBufferV3?
+    nonisolated(unsafe) private var detModel: VNCoreMLModel?
     nonisolated(unsafe) private var prevPositions: [String: CGPoint] = [:]
     private var currentInput: AVCaptureDeviceInput?
 
@@ -62,17 +58,14 @@ class FSDV3Engine: NSObject, ObservableObject {
         haptic.prepare()
     }
 
-    // MARK: - 传感器
     private func setupSensors() {
         locationManager.delegate = self
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
-        
         if motion.isDeviceMotionAvailable {
             motion.deviceMotionUpdateInterval = 1/60
             motion.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
                 guard let data = data, let self = self else { return }
-                // IMU 驱动路径弯曲
                 self.autoPitch = 0.05 * data.attitude.pitch + 0.95 * self.autoPitch
                 self.yawRate = 0.15 * data.rotationRate.z + 0.85 * self.yawRate
             }
@@ -83,41 +76,31 @@ class FSDV3Engine: NSObject, ObservableObject {
         Task {
             let config = MLModelConfiguration()
             config.computeUnits = .all 
-            if let url = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
+            // 兼容 SPM 的资源加载方式
+            let modelURL = Bundle.module.url(forResource: "yolov8l", withExtension: "mlmodelc") ?? 
+                           Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc")
+            
+            if let url = modelURL,
                let mDet = try? MLModel(contentsOf: url, configuration: config),
                let vDet = try? VNCoreMLModel(for: mDet) {
-                self.safeModel = SafeModelBufferV3(detModel: vDet)
+                self.detModel = vDet
             }
         }
     }
 
-    // MARK: - 并发安全的夜视增强 (修复 Actor 报错)
     nonisolated private func applyNightVision(to image: CIImage) -> CIImage {
         let extent = image.extent
         let vector = CIVector(cgRect: extent)
-        
-        guard let avgFilter = CIFilter(name: "CIAreaAverage", 
-                                       parameters: [kCIInputImageKey: image, kCIInputExtentKey: vector])?.outputImage else { 
-            return image 
-        }
-        
+        guard let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [kCIInputImageKey: image, kCIInputExtentKey: vector])?.outputImage else { return image }
         var bitmap = [UInt8](repeating: 0, count: 4)
         ciContext.render(avgFilter, toBitmap: &bitmap, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: nil)
-        
         let luminance = Float(bitmap[0]) / 255.0
         
-        Task { @MainActor in
-            self.isNightMode = luminance < 0.35
-        }
+        Task { @MainActor in self.isNightMode = luminance < 0.35 }
         
         if luminance < 0.35 {
-            let exp = CIFilter.exposureAdjust()
-            exp.inputImage = image
-            exp.ev = 1.3
-            
-            let color = CIFilter.colorControls()
-            color.inputImage = exp.outputImage
-            color.contrast = 1.25
+            let exp = CIFilter.exposureAdjust(); exp.inputImage = image; exp.ev = 1.3
+            let color = CIFilter.colorControls(); color.inputImage = exp.outputImage; color.contrast = 1.25
             return color.outputImage ?? image
         }
         return image
@@ -128,7 +111,6 @@ class FSDV3Engine: NSObject, ObservableObject {
         let output = AVCaptureVideoDataOutput()
         output.setSampleBufferDelegate(self, queue: queue)
         if session.canAddOutput(output) { session.addOutput(output) }
-        
         let capture = self.session
         DispatchQueue.global(qos: .userInitiated).async { capture.startRunning() }
     }
@@ -139,6 +121,7 @@ class FSDV3Engine: NSObject, ObservableObject {
         if target != cameraMode {
             switchCamera(to: target)
             self.cameraMode = target
+            self.internalMode = target // 更新非隔离变量
         }
     }
 
@@ -147,21 +130,13 @@ class FSDV3Engine: NSObject, ObservableObject {
         if let input = currentInput { session.removeInput(input) }
         let type: AVCaptureDevice.DeviceType = (mode == .telephoto) ? .builtInWideAngleCamera : .builtInUltraWideCamera
         guard let dev = AVCaptureDevice.default(type, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: dev) else {
-            session.commitConfiguration()
-            return
-        }
-        if session.canAddInput(input) {
-            session.addInput(input)
-            currentInput = input
-        }
+              let input = try? AVCaptureDeviceInput(device: dev) else { session.commitConfiguration(); return }
+        if session.canAddInput(input) { session.addInput(input); currentInput = input }
         session.commitConfiguration()
     }
 }
 
-// MARK: - 3. 并发算法实现
 extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
-    
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
         let speed = max(0, loc.speed * 3.6)
@@ -169,46 +144,45 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
     }
 
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixel = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let container = self.safeModel else { return }
+        guard let pixel = CMSampleBufferGetImageBuffer(sampleBuffer), 
+              let model = self.detModel else { return }
         
         let rawCI = CIImage(cvPixelBuffer: pixel)
         let processedCI = applyNightVision(to: rawCI)
         
-        // OCR 请求
+        // 核心修复：直接读取非隔离的 internalMode
+        let currentMode = self.internalMode
+        
+        let detReq = VNCoreMLRequest(model: model) { req, _ in
+            if let results = req.results as? [VNRecognizedObjectObservation] {
+                Task { @MainActor in self.analyzeWorld(results) }
+            }
+        }
+        
+        if currentMode == .telephoto { 
+            detReq.regionOfInterest = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6) 
+        }
+
         let ocrReq = VNRecognizeTextRequest { req, _ in
             if let results = req.results as? [VNRecognizedTextObservation] {
                 Task { @MainActor in
                     for obs in results {
-                        if let top = obs.topCandidates(1).first, let val = Int(top.string.filter({$0.isNumber})), val >= 20 {
-                            self.speedLimit = val
+                        if let top = obs.topCandidates(1).first, 
+                           let val = Int(top.string.filter({$0.isNumber})), val >= 20 { 
+                            self.speedLimit = val 
                         }
                     }
                 }
             }
         }
 
-        // YOLO 检测
-        let detReq = VNCoreMLRequest(model: container.detModel) { req, _ in
-            if let results = req.results as? [VNRecognizedObjectObservation] {
-                Task { @MainActor in self.analyzeWorld(results) }
-            }
-        }
-        
-        // 通过 DispatchQueue 获取状态，避免直接在后台访问 Actor 属性
-        let currentMode = DispatchQueue.main.sync { self.cameraMode }
-        if currentMode == .telephoto {
-            detReq.regionOfInterest = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6)
-        }
-
         let segReq = VNGenerateForegroundInstanceMaskRequest()
-        
         try? VNImageRequestHandler(ciImage: processedCI, orientation: .right).perform([ocrReq, detReq, segReq])
         
-        if let maskObs = segReq.results?.first {
-            if let cg = self.ciContext.createCGImage(CIImage(cvPixelBuffer: maskObs.instanceMask), from: CIImage(cvPixelBuffer: maskObs.instanceMask).extent) {
-                Task { @MainActor in self.occupancyMask = cg }
-            }
+        if let maskObs = segReq.results?.first, 
+           let cg = self.ciContext.createCGImage(CIImage(cvPixelBuffer: maskObs.instanceMask), 
+                                                from: CIImage(cvPixelBuffer: maskObs.instanceMask).extent) {
+            Task { @MainActor in self.occupancyMask = cg }
         }
     }
 
@@ -216,11 +190,9 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
     private func analyzeWorld(_ observations: [VNRecognizedObjectObservation]) {
         var nextObjs: [FSDV3Object] = []
         var sideAlert: Edge? = nil
-        
         for obs in observations {
             let label = obs.labels.first?.identifier ?? "target"
             let center = CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
-            
             let prev = prevPositions[label] ?? center
             let vector = CGVector(dx: (center.x - prev.x) * 25, dy: (center.y - prev.y) * 25)
             prevPositions[label] = center
@@ -239,73 +211,37 @@ extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationM
     }
 }
 
-// MARK: - 4. 终端 UI 界面
-struct FSDMasterViewV3: View {
+// MARK: - 主视图
+struct FSDMasterView: View {
     @StateObject var engine = FSDV3Engine()
-    
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            
-            // 4.1 占用网络网格
             if let mask = engine.occupancyMask {
-                Image(decorative: mask, scale: 1.0)
-                    .resizable()
-                    .renderingMode(.template)
-                    .foregroundColor(.cyan.opacity(0.3))
-                    .ignoresSafeArea()
+                Image(decorative: mask, scale: 1.0).resizable().renderingMode(.template).foregroundColor(.cyan.opacity(0.3)).ignoresSafeArea()
             }
-            
-            // 4.2 3D Zen Path (Tesla 风格路径规划)
             GeometryReader { geo in
                 Path { path in
-                    let w = geo.size.width
-                    let h = geo.size.height
+                    let w = geo.size.width; let h = geo.size.height
                     path.move(to: CGPoint(x: w * 0.5, y: h))
-                    
-                    let vY = h * (0.45 + engine.autoPitch * 0.1)
-                    let vX = w * 0.5 + (engine.yawRate * 150)
-                    
-                    let c1 = CGPoint(x: w * 0.5 + (engine.yawRate * 450), y: h * 0.8)
-                    let c2 = CGPoint(x: w * 0.5 + (engine.yawRate * 200), y: h * 0.6)
-                    
+                    let vY = h * (0.45 + engine.autoPitch * 0.1); let vX = w * 0.5 + (engine.yawRate * 150)
+                    let c1 = CGPoint(x: w * 0.5 + (engine.yawRate * 450), y: h * 0.8); let c2 = CGPoint(x: w * 0.5 + (engine.yawRate * 200), y: h * 0.6)
                     path.addCurve(to: CGPoint(x: vX, y: vY), control1: c1, control2: c2)
                 }
-                .stroke(
-                    LinearGradient(colors: [.cyan.opacity(0.8), .blue.opacity(0)], startPoint: .bottom, endPoint: .top),
-                    style: StrokeStyle(lineWidth: 65, lineCap: .round, lineJoin: .round)
-                )
-                .blur(radius: 12)
-                .blendMode(.screen)
-                .opacity(engine.currentSpeed > 5 ? 0.65 : 0)
+                .stroke(LinearGradient(colors: [.cyan.opacity(0.8), .blue.opacity(0)], startPoint: .bottom, endPoint: .top), style: StrokeStyle(lineWidth: 65, lineCap: .round, lineJoin: .round))
+                .blur(radius: 12).blendMode(.screen).opacity(engine.currentSpeed > 5 ? 0.65 : 0)
             }
-
-            // 4.3 侧方危险流光
             HStack {
                 Rectangle().fill(LinearGradient(colors: [.red.opacity(engine.sideWarning == .leading ? 0.8 : 0), .clear], startPoint: .leading, endPoint: .trailing)).frame(width: 85)
                 Spacer()
                 Rectangle().fill(LinearGradient(colors: [.clear, .red.opacity(engine.sideWarning == .trailing ? 0.8 : 0)], startPoint: .leading, endPoint: .trailing)).frame(width: 85)
             }.ignoresSafeArea()
-            
-            // 4.4 动态目标识别框
             GeometryReader { geo in
                 ForEach(engine.trackedObjects) { obj in
                     let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
-                    
-                    Path { p in
-                        let start = CGPoint(x: rect.midX, y: geo.size.height - rect.minY)
-                        p.move(to: start)
-                        p.addLine(to: CGPoint(x: start.x + obj.velocityVector.dx * 100, y: start.y - obj.velocityVector.dy * 150))
-                    }.stroke(Color.yellow, style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
-                    
-                    RoundedRectangle(cornerRadius: 2)
-                        .stroke(obj.isCritical ? Color.red : (obj.isSideHazard ? Color.orange : Color.white), lineWidth: 1.5)
-                        .frame(width: rect.width, height: rect.height)
-                        .position(x: rect.midX, y: geo.size.height - rect.minY)
+                    RoundedRectangle(cornerRadius: 2).stroke(obj.isCritical ? Color.red : (obj.isSideHazard ? Color.orange : Color.white), lineWidth: 1.5).frame(width: rect.width, height: rect.height).position(x: rect.midX, y: geo.size.height - rect.minY)
                 }
             }
-            
-            // 4.5 HUD 状态栏
             VStack {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading) {
@@ -314,30 +250,16 @@ struct FSDMasterViewV3: View {
                     }
                     Spacer()
                     if engine.speedLimit > 0 {
-                        ZStack {
-                            Circle().strokeBorder(Color.red, lineWidth: 5).background(Circle().fill(.white))
-                            Text("\(engine.speedLimit)").font(.system(size: 20, weight: .bold)).foregroundColor(.black)
-                        }.frame(width: 55, height: 55)
+                        ZStack { Circle().strokeBorder(Color.red, lineWidth: 5).background(Circle().fill(.white)); Text("\(engine.speedLimit)").font(.system(size: 20, weight: .bold)).foregroundColor(.black) }.frame(width: 55, height: 55)
                     }
-                    Spacer()
-                    VStack(alignment: .trailing) {
-                        Image(systemName: engine.isNightMode ? "moon.stars.fill" : (engine.cameraMode == .telephoto ? "scope" : "eye.circle"))
-                        Text(engine.cameraMode.rawValue).font(.system(size: 8, weight: .bold))
-                    }.foregroundColor(engine.isNightMode ? .yellow : (engine.cameraMode == .telephoto ? .yellow : .cyan))
-                }
-                .padding(30).background(Color.black.opacity(0.4)).foregroundColor(.white)
+                }.padding(30).foregroundColor(.white)
                 Spacer()
             }
         }
     }
 }
 
-// MARK: - 5. App 启动入口 (修复 Linker _main 报错)
 @main
-struct ADASFinalApp: App {
-    var body: some Scene {
-        WindowGroup {
-            FSDMasterViewV3()
-        }
-    }
+struct ADASApp: App {
+    var body: some Scene { WindowGroup { FSDMasterView() } }
 }
