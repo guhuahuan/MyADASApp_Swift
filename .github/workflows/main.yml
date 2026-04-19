@@ -35,18 +35,21 @@ jobs:
 
       - name: Build for iPhone Device
         run: |
-          # 1. 清理旧缓存
+          # 1. 清理缓存
           swift package clean
           
-          # 2. 获取 iOS SDK 路径
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "Using iOS SDK: $SDK_PATH"
+          # 2. 导出关键环境变量，强制 Clang 使用 iOS SDK
+          export SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Target SDKROOT: $SDKROOT"
           
-          # 3. 执行编译
-          # 使用 -Xswiftc 传递参数，并利用双引号确保路径中的空格被正确处理
+          # 3. 强制编译命令
+          # -Xcc -isysroot 是为了封死 C 编译器的头文件搜索路径
+          # -Xcc --target 是为了确保底层的模块映射正确
           swift build -c release \
             --triple arm64-apple-ios17.0 \
-            -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
+            -Xswiftc -sdk -Xswiftc "$SDKROOT" \
+            -Xcc -isysroot -Xcc "$SDKROOT" \
+            -Xcc --target=arm64-apple-ios17.0 \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
             
       - name: Upload Artifact
