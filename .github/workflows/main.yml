@@ -1,53 +1,38 @@
-name: Build FSD V3 ADAS
+name: Build FSD V4 ADAS
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
 
 jobs:
   build:
-    runs-on: macos-14 # 使用包含 Xcode 15/16 的最新 macOS 环境
+    runs-on: macos-14
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Permissions (Info.plist Injection)
+      - name: Setup Info.plist
         run: |
-          # 如果文件不存在，先创建一个基础的 Plist
-          if [ ! -f Info.plist ]; then
-            echo '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict></dict></plist>' > Info.plist
-          fi
-          
-          # 使用 PlistBuddy 注入隐私权限描述
-          /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string 'FSD视觉引擎需要访问相机以进行路况识别'" Info.plist || \
-          /usr/libexec/PlistBuddy -c "Set :NSCameraUsageDescription 'FSD视觉引擎需要访问相机以进行路况识别'" Info.plist
-          
-          /usr/libexec/PlistBuddy -c "Add :NSLocationWhenInUseUsageDescription string '计算车速并动态调整检测焦距'" Info.plist || \
-          /usr/libexec/PlistBuddy -c "Set :NSLocationWhenInUseUsageDescription '计算车速并动态调整检测焦距'" Info.plist
-          
-          /usr/libexec/PlistBuddy -c "Add :NSMotionUsageDescription string '用于3D路径的姿态感应与实时修正'" Info.plist || \
-          /usr/libexec/PlistBuddy -c "Set :NSMotionUsageDescription '用于3D路径的姿态感应与实时修正'" Info.plist
-          
-          echo "✅ 权限注入完成"
+          # 创建权限声明文件
+          echo '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>
+            <key>NSCameraUsageDescription</key><string>AI识别路况</string>
+            <key>NSLocationWhenInUseUsageDescription</key><string>计算车速</string>
+            <key>NSMotionUsageDescription</key><string>路径姿态修正</string>
+          </dict></plist>' > Info.plist
 
-      - name: Set Xcode Version
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app # 或者根据环境选择 16.0
-
-      - name: Build for iOS
+      - name: Build for Real iPhone
         run: |
-          # 获取 SDK 路径
+          # 动态获取真机 SDK 路径
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 执行编译
-          # 注意：这里我们强制将 Info.plist 链接进二进制
-          xcodebuild build \
-            -project *.xcodeproj \
-            -scheme YourAppSchemeName \
-            -sdk iphoneos \
-            -configuration Release \
-            CODE_SIGNING_ALLOWED=NO \
-            INFOPLIST_FILE=Info.plist \
-            GENERATE_INFOPLIST=NO
+          # 核心构建命令：指向真机 arm64 架构，并注入权限
+          swift build -c release --triple arm64-apple-ios17.0 \
+            -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
+            -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
+            
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: FSD-ADAS-Binary
+          path: .build/arm64-apple-ios17.0/release/MyADASApp_Swift
