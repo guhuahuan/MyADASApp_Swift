@@ -59,15 +59,9 @@ jobs:
           rm -rf Payload
           mkdir -p Payload/MyADASApp_Swift.app
           
-          # 1. 全域搜索二进制文件 (解决路径找不到的问题)
-          echo "Searching for binary..."
+          # 1. 搜索并拷贝二进制文件
           BINARY_PATH=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
-          
-          if [ -z "$BINARY_PATH" ]; then
-            echo "❌ Error: Could not find binary file!"
-            exit 1
-          fi
-          
+          echo "Found Binary at: $BINARY_PATH"
           cp "$BINARY_PATH" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod 755 Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
@@ -75,26 +69,22 @@ jobs:
           cp Info.plist Payload/MyADASApp_Swift.app/Info.plist
           echo "APPL????" > Payload/MyADASApp_Swift.app/PkgInfo
           
-          # 3. 强制查找并拷贝 AI 模型 (确保体积正常)
-          echo "Searching for compiled models..."
-          # 优先查找编译后的 .mlmodelc
-          MODEL_PATH=$(find .build -name "*.mlmodelc" -type d | head -n 1)
-          
-          if [ -n "$MODEL_PATH" ]; then
-            echo "Found compiled model at: $MODEL_PATH"
-            cp -r "$MODEL_PATH" Payload/MyADASApp_Swift.app/
+          # 3. 【核心修正】全量搜索并拷贝模型目录
+          # 这里的 -type d 确保拷贝的是编译后的 .mlmodelc 文件夹
+          MODEL_DIR=$(find .build -name "*.mlmodelc" -type d | head -n 1)
+          if [ -n "$MODEL_DIR" ]; then
+            echo "Found compiled model at: $MODEL_DIR"
+            cp -r "$MODEL_DIR" Payload/MyADASApp_Swift.app/
           else
-            echo "⚠️ Warning: .mlmodelc not found, copying raw package from Sources."
-            cp -r Sources/yolov8l.mlpackage Payload/MyADASApp_Swift.app/
+            echo "Warning: .mlmodelc not found, using raw Sources fallback."
+            cp -r Sources/*.mlpackage Payload/MyADASApp_Swift.app/
           fi
           
-          # 4. 打印目录结构校验
-          echo "--- Final Bundle Contents ---"
+          # 4. 打印打包清单（用于在日志中确认文件已进入 App 根目录）
+          echo "--- FINAL BUNDLE CONTENTS ---"
           ls -R Payload/MyADASApp_Swift.app
           
-          # 5. 打包并检查大小
           zip -r MyADASApp_Swift.ipa Payload
-          echo "Final IPA Size:"
           du -sh MyADASApp_Swift.ipa
 
       - name: Upload Artifact
