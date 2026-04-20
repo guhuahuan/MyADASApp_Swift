@@ -13,9 +13,9 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          lfs: true # 关键：必须拉取 LFS 中的 weights 文件夹
+          lfs: true # 关键修补：必须拉取模型大文件
 
-      - name: Setup Info.plist (ADAS Specific)
+      - name: Setup Info.plist (ADAS 规格)
         run: |
           cat <<EOF > Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
@@ -31,9 +31,9 @@ jobs:
               <key>LSRequiresIPhoneOS</key><true/>
               <key>MinimumOSVersion</key><string>17.0</string>
               
-              <key>NSCameraUsageDescription</key><string>需要相机进行 AI 环境感知与碰撞预警</string>
+              <key>NSCameraUsageDescription</key><string>需要相机进行实时道路环境感知与碰撞预警</string>
               <key>NSLocationWhenInUseUsageDescription</key><string>需要 GPS 数据计算实时车速与航向</string>
-              <key>NSMotionUsageDescription</key><string>需要陀螺仪数据进行 3D 轨迹 AR 修正</string>
+              <key>NSMotionUsageDescription</key><string>需要陀螺仪数据进行 3D 引导轨迹 AR 修正代</string>
               
               <key>UISupportedInterfaceOrientations</key>
               <array>
@@ -47,7 +47,7 @@ jobs:
           </plist>
           EOF
 
-      - name: Build Swift Binary
+      - name: Swift Build
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           swift build -c release \
@@ -56,9 +56,9 @@ jobs:
             -Xcc -isysroot -Xcc "$SDK_PATH" \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 
-      - name: Compile and Assemble IPA
+      - name: 组装与校验 IPA ( Robust Logic )
         run: |
-          # 1. 初始化目录
+          # 1. 初始化
           rm -rf Payload
           mkdir -p Payload/MyADASApp_Swift.app
           
@@ -67,31 +67,19 @@ jobs:
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 3. 寻找源码模型 (排除 .build 目录的干扰)
-          RAW_MODEL=$(find . -name "*.mlmodel" -not -path "./.build/*" | head -n 1)
-          if [ -z "$RAW_MODEL" ]; then
-            echo "❌ Error: Source .mlmodel not found in repository!"
+          # 3. 【核心修复】强制更名编译路径以适配代码
+          # 代码寻找 yolov8l.mlmodelc。CI环境寻找任何编译后的文件。
+          MODEL=$(find . -name "*.mlmodelc" -type d | head -n 1)
+          if [ -n "$MODEL" ]; then
+            cp -r "$MODEL" Payload/MyADASApp_Swift.app/yolov8l.mlmodelc
+          else
+            echo "❌ Error: 模型未找到。检查 LFS 状态！"
             exit 1
           fi
           
-          # 4. 编译模型并强制更名
-          # 这样无论你模型叫什么，App 内部都统一使用 yolov8l.mlmodelc
-          echo "🚀 Compiling $RAW_MODEL ..."
-          mkdir -p temp_compile
-          xcrun coremlcompiler compile "$RAW_MODEL" temp_compile/
-          
-          COMPILED_DIR=$(find temp_compile -name "*.mlmodelc" -type d | head -n 1)
-          cp -r "$COMPILED_DIR" Payload/MyADASApp_Swift.app/yolov8l.mlmodelc
-          
-          # 5. 补充配置
+          # 4. 拷贝权限文件
           cp Info.plist Payload/MyADASApp_Swift.app/
           
-          # 6. 打包
-          zip -r FSD_V4_Production.ipa Payload
-          echo "✅ Final IPA Size: $(du -sh FSD_V4_Production.ipa)"
-
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: FSD-V4-Production-IPA
-          path: FSD_V4_Production.ipa
+          # 5. 打包成 IPA 并输出最终体积
+          zip -r FSD_V4_Horizontal.ipa Payload
+          ls -lh FSD_V4_Horizontal.ipa # 关键修补：显示体积，它必须 > 30MB
