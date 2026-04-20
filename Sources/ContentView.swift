@@ -32,8 +32,9 @@ struct FSDMainView: View {
                         context.stroke(Path(rect), with: .color(.cyan), lineWidth: 2)
                         
                         var title = detection.label
-                        if let speed = engine.currentSpeed, speed > 0.5 {
-                            title += " \(String(format: "%.1f", speed * 3.6))km/h"
+                        // --- 修复后的逻辑 ---
+                        if engine.currentSpeed > 0.5 {
+                            title += " \(String(format: "%.1f", engine.currentSpeed * 3.6))km/h"
                         }
                         
                         context.draw(Text(title).font(.caption).bold().foregroundColor(.cyan), 
@@ -93,20 +94,19 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
     }
 
     private func setupModel() {
-        // 自动探测编译后的模型位置
         let possibleURLs = [
             Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
             Bundle.main.url(forResource: "yolov8l.mlpackage/Data/com.apple.CoreML/model", withExtension: "mlmodelc")
         ]
         
         guard let modelURL = possibleURLs.compactMap({ $0 }).first else {
-            self.errorMessage = "ERROR: YOLOv8L.mlmodelc not found in Bundle"
+            self.errorMessage = "ERROR: YOLOv8L.mlmodelc not found"
             return
         }
 
         do {
             let config = MLModelConfiguration()
-            config.computeUnits = .all // 优先使用 NPU/GPU
+            config.computeUnits = .all 
             let model = try MLModel(contentsOf: modelURL, configuration: config)
             let visionModel = try VNCoreMLModel(for: model)
             
@@ -139,7 +139,6 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
         output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "vision_queue"))
         captureSession.addOutput(output)
         
-        // 关键：异步开启，防止启动闪退
         DispatchQueue.global(qos: .userInitiated).async {
             self.captureSession.startRunning()
         }
