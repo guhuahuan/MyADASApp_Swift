@@ -22,58 +22,46 @@ struct FSDMasterView: View {
             // 1. 底层：横屏相机预览
             CameraPreview(session: engine.captureSession).edgesIgnoringSafeArea(.all)
             
-            // 2. 中层：AR 增强现实渲染
+            // 2. 中层：AR 增强渲染 (3D轨迹 + 碰撞预警)
             GeometryReader { geo in
                 Canvas { context, size in
-                    // --- 功能 A: 3D 动态引导轨迹 (随陀螺仪摆动) ---
-                    drawAdvanced3DPath(context: context, size: size, attitude: engine.deviceAttitude)
+                    // 绘制 3D 引导线 (动态随陀螺仪偏移)
+                    draw3DPath(context: context, size: size, attitude: engine.deviceAttitude)
                     
-                    // --- 功能 B: 车道感知边界线 ---
-                    drawLanePerception(context: context, size: size)
-                    
-                    // --- 功能 C: AI 目标锁定与危险预警 ---
                     for detection in engine.detections {
                         let rect = engine.convertRect(detection.boundingBox, to: size)
                         let hazard = engine.calculateHazard(rect: rect)
                         let isDanger = hazard > 0.75
                         let color: Color = isDanger ? .red : (hazard > 0.4 ? .yellow : .green)
                         
-                        // 绘制科技感锁定角标
+                        // 绘制锁定角标
                         drawTargetCorners(context: context, rect: rect, color: color, isDanger: isDanger)
                         
-                        // 目标标签：类别 + 模拟距离
-                        let dist = Int(150 / (rect.width / size.width * 12))
-                        let label = "\(detection.label.uppercased()) | \(dist)M"
-                        context.draw(Text(label).font(.system(size: 10, weight: .black)).foregroundColor(color), 
+                        // 距离显示
+                        let dist = Int(140 / (rect.width / size.width * 11))
+                        context.draw(Text("\(detection.label.uppercased()) | \(dist)M").font(.system(size: 10, weight: .black)).foregroundColor(color), 
                                      at: CGPoint(x: rect.minX, y: rect.minY - 15))
                     }
                 }
             }
             
             // 3. 顶层：HUD 数字化仪表
-            FSD_HUD_Overlay(engine: engine)
+            HUDLayer(engine: engine)
         }
         .onAppear { engine.startSystems() }
     }
 
-    func drawAdvanced3DPath(context: GraphicsContext, size: CGSize, attitude: CMAttitude?) {
-        let roll = CGFloat(attitude?.roll ?? 0) * 220 // 动态补偿系数
+    func draw3DPath(context: GraphicsContext, size: CGSize, attitude: CMAttitude?) {
+        let roll = CGFloat(attitude?.roll ?? 0) * 200
         var p = Path()
-        p.move(to: CGPoint(x: size.width * 0.15, y: size.height))
+        p.move(to: CGPoint(x: size.width * 0.1, y: size.height))
         p.addCurve(to: CGPoint(x: size.width * 0.5 + roll, y: size.height * 0.45), 
-                   control1: CGPoint(x: size.width * 0.25, y: size.height * 0.8), 
-                   control2: CGPoint(x: size.width * 0.45, y: size.height * 0.6))
-        p.addCurve(to: CGPoint(x: size.width * 0.85, y: size.height), 
-                   control1: CGPoint(x: size.width * 0.55 + roll, y: size.height * 0.6), 
-                   control2: CGPoint(x: size.width * 0.75, y: size.height * 0.8))
+                   control1: CGPoint(x: size.width * 0.2, y: size.height * 0.8), 
+                   control2: CGPoint(x: size.width * 0.4, y: size.height * 0.6))
+        p.addCurve(to: CGPoint(x: size.width * 0.9, y: size.height), 
+                   control1: CGPoint(x: size.width * 0.6 + roll, y: size.height * 0.6), 
+                   control2: CGPoint(x: size.width * 0.8, y: size.height * 0.8))
         context.fill(p, with: .linearGradient(Gradient(colors: [.blue.opacity(0.4), .clear]), startPoint: CGPoint(x: 0, y: size.height), endPoint: CGPoint(x: 0, y: size.height * 0.45)))
-    }
-
-    func drawLanePerception(context: GraphicsContext, size: CGSize) {
-        let l = Path { p in p.move(to: CGPoint(x: 50, y: size.height)); p.addLine(to: CGPoint(x: size.width*0.38, y: size.height*0.5)) }
-        let r = Path { p in p.move(to: CGPoint(x: size.width-50, y: size.height)); p.addLine(to: CGPoint(x: size.width*0.62, y: size.height*0.5)) }
-        context.stroke(l, with: .color(.white.opacity(0.15)), lineWidth: 1)
-        context.stroke(r, with: .color(.white.opacity(0.15)), lineWidth: 1)
     }
 
     func drawTargetCorners(context: GraphicsContext, rect: CGRect, color: Color, isDanger: Bool) {
@@ -87,25 +75,19 @@ struct FSDMasterView: View {
     }
 }
 
-// MARK: - HUD 组件
-struct FSD_HUD_Overlay: View {
+// MARK: - HUD 视图组件
+struct HUDLayer: View {
     @ObservedObject var engine: FSDCoreEngine
     var body: some View {
         VStack {
             HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("FSD V4.0 MASTER").font(.system(size: 14, weight: .black, design: .monospaced)).foregroundColor(.cyan)
-                    HStack {
-                        StatusTag(text: "AI: \(engine.detections.count)", active: engine.isModelLoaded)
-                        StatusTag(text: "NPU", active: true)
-                        StatusTag(text: "FPS: \(engine.fps)", active: engine.fps > 20)
-                    }
-                    Text(engine.headingInfo).font(.system(size: 10, design: .monospaced)).foregroundColor(.white.opacity(0.8))
+                VStack(alignment: .leading) {
+                    Text("FSD MASTER V4.0").font(.system(size: 14, weight: .black, design: .monospaced)).foregroundColor(.cyan)
+                    Text(engine.headingInfo).font(.system(size: 10, design: .monospaced)).foregroundColor(.white)
                 }
                 Spacer()
-                // 大号速度表
                 VStack(alignment: .trailing) {
-                    Text("\(Int(engine.currentSpeed * 3.6))").font(.system(size: 75, weight: .black, design: .monospaced)).foregroundColor(.yellow)
+                    Text("\(Int(engine.currentSpeed * 3.6))").font(.system(size: 70, weight: .black, design: .monospaced)).foregroundColor(.yellow)
                     Text("KM/H").font(.caption).bold().foregroundColor(.yellow)
                 }
             }
@@ -113,31 +95,20 @@ struct FSD_HUD_Overlay: View {
             
             Spacer()
             
-            // 碰撞告警浮层
             if engine.detections.contains(where: { engine.calculateHazard(rect: engine.convertRect($0.boundingBox, to: UIScreen.main.bounds.size)) > 0.75 }) {
                 Text("⚠️ COLLISION RISK")
                     .font(.system(size: 20, weight: .black)).foregroundColor(.white).padding().background(Color.red).cornerRadius(10).padding(.bottom, 30)
             }
-            
-            HStack {
-                Text("LATENCY: \(Int(engine.latency * 1000))MS").foregroundColor(.green)
-                Spacer()
-                Text("PITCH: \(String(format: "%.1f°", engine.pitch * 180 / .pi))").foregroundColor(.white.opacity(0.5))
-            }
-            .font(.system(size: 10, design: .monospaced)).padding(.horizontal, 40).padding(.bottom, 10)
         }
     }
 }
 
-// MARK: - 核心计算引擎
+// MARK: - 引擎逻辑
 class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detections: [Detection] = []
     @Published var currentSpeed: CLLocationSpeed = 0
-    @Published var headingInfo: String = "DIR: --"
+    @Published var headingInfo: String = "HEADING: --"
     @Published var isModelLoaded = false
-    @Published var latency: TimeInterval = 0
-    @Published var fps: Int = 0
-    @Published var pitch: Double = 0
     @Published var deviceAttitude: CMAttitude?
     
     private let focusLabels = ["person", "car", "truck", "bus", "motorcycle", "bicycle"]
@@ -145,7 +116,6 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
     private let locationManager = CLLocationManager()
     private let motionManager = CMMotionManager()
     private var requests = [VNRequest]()
-    private var lastTime = Date()
     
     struct Detection { let label: String; let boundingBox: CGRect }
 
@@ -164,9 +134,6 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
             let request = VNCoreMLRequest(model: vnModel) { [weak self] req, _ in
                 if let results = req.results as? [VNRecognizedObjectObservation] {
                     DispatchQueue.main.async {
-                        let diff = Date().timeIntervalSince(self?.lastTime ?? Date())
-                        self?.latency = diff
-                        self?.fps = Int(1.0 / diff)
                         self?.detections = results.compactMap { res in
                             let label = res.labels.first?.identifier ?? ""
                             return (self?.focusLabels.contains(label) == true) ? Detection(label: label, boundingBox: res.boundingBox) : nil
@@ -177,7 +144,7 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
             request.imageCropAndScaleOption = .scaleFill
             self.requests = [request]
             self.isModelLoaded = true
-        } catch { print("AI Load Failed") }
+        } catch { print("AI ERROR") }
     }
 
     private func setupPermissions() {
@@ -193,7 +160,6 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
             motionManager.deviceMotionUpdateInterval = 1/30
             motionManager.startDeviceMotionUpdates(to: .main) { motion, _ in 
                 self.deviceAttitude = motion?.attitude
-                self.pitch = motion?.attitude.pitch ?? 0
             }
         }
     }
@@ -203,15 +169,14 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
         try? captureSession.addInput(AVCaptureDeviceInput(device: device))
         let output = AVCaptureVideoDataOutput()
         output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "vision_queue"))
-        if captureSession.canAddOutput(output) { captureSession.addOutput(output) }
+        captureSession.addOutput(output)
         if let conn = output.connection(with: .video) { conn.videoOrientation = .landscapeRight }
         DispatchQueue.global(qos: .userInitiated).async { self.captureSession.startRunning() }
     }
 
-    func captureOutput(_ output: AVCaptureOutput, didOutput b: CMSampleBuffer, from c: AVCaptureConnection) {
-        lastTime = Date()
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(b) else { return }
-        try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up).perform(self.requests)
+    func captureOutput(_ o: AVCaptureOutput, didOutput b: CMSampleBuffer, from c: AVCaptureConnection) {
+        guard let pb = CMSampleBufferGetImageBuffer(b) else { return }
+        try? VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up).perform(self.requests)
     }
 
     func convertRect(_ rect: CGRect, to size: CGSize) -> CGRect {
@@ -228,14 +193,7 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
     func locationManager(_ m: CLLocationManager, didUpdateLocations l: [CLLocation]) { currentSpeed = max(0, l.last?.speed ?? 0) }
     func locationManager(_ m: CLLocationManager, didUpdateHeading h: CLHeading) {
         let dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-        headingInfo = "DIR: \(dirs[Int((h.magneticHeading + 22.5) / 45.0) & 7]) \(Int(h.magneticHeading))°"
-    }
-}
-
-struct StatusTag: View {
-    let text: String; let active: Bool
-    var body: some View {
-        Text(text).font(.system(size: 8, weight: .black)).padding(3).background(active ? Color.blue : Color.red).foregroundColor(.white).cornerRadius(3)
+        headingInfo = "HEADING: \(dirs[Int((h.magneticHeading + 22.5) / 45.0) & 7]) \(Int(h.magneticHeading))°"
     }
 }
 
