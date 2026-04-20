@@ -1,20 +1,21 @@
-name: FSD V4 FINAL PACK
+name: FSD V4.0 HORIZONTAL MASTER BUILD
 
 on:
   push:
     branches: [ main ]
+  workflow_dispatch: # 支持手动触发构建
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-14 # 使用最新的 macOS 运行环境以支持 iOS 17 SDK
 
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          lfs: true # 必须开启 LFS，否则你的模型会变成 1KB 报错
+          lfs: true # 如果你的 mlmodelc 很大，确保开启 LFS
 
-      - name: Create Info.plist
+      - name: Create Full Spec Info.plist
         run: |
           cat <<EOF > Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
@@ -29,43 +30,59 @@ jobs:
               <key>CFBundleVersion</key><string>1</string>
               <key>LSRequiresIPhoneOS</key><true/>
               <key>MinimumOSVersion</key><string>17.0</string>
-              <key>NSCameraUsageDescription</key><string>用于AI实时识别路况</string>
-              <key>NSLocationWhenInUseUsageDescription</key><string>用于速度与航向计算</string>
-              <key>NSMotionUsageDescription</key><string>用于AR地平线实时修正</string>
+              
+              <key>NSCameraUsageDescription</key><string>需要相机进行 AI 道路环境感知与碰撞检测</string>
+              <key>NSLocationWhenInUseUsageDescription</key><string>需要 GPS 数据计算实时车速与航向</string>
+              <key>NSMotionUsageDescription</key><string>需要陀螺仪数据进行 3D 轨迹 AR 姿态修正代</string>
+              
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <key>UIInterfaceOrientation</key>
+              <string>UIInterfaceOrientationLandscapeRight</string>
+
               <key>UILaunchScreen</key><dict/>
           </dict>
           </plist>
           EOF
 
-      - name: Build Binary
+      - name: Setup Swift & SDK Path
         run: |
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          sudo xcode-select -s /Applications/Xcode_15.3.app
+          echo "SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)" >> $GITHUB_ENV
+
+      - name: Compile Swift for iOS (Arm64)
+        run: |
           swift build -c release \
             --triple arm64-apple-ios17.0 \
-            -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
-            -Xcc -isysroot -Xcc "$SDK_PATH" \
+            -Xswiftc -sdk -Xswiftc ${{ env.SDK_PATH }} \
+            -Xcc -isysroot -Xcc ${{ env.SDK_PATH }} \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 
-      - name: Assemble Full Package
+      - name: Assemble IPA (The Production Bundle)
         run: |
+          # 1. 创建 App 包目录
           rm -rf Payload
           mkdir -p Payload/MyADASApp_Swift.app
           
-          # 1. 拷贝主程序
-          BIN=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
-          cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
-          chmod 755 Payload/MyADASApp_Swift.app/MyADASApp_Swift
+          # 2. 拷贝二进制文件
+          BIN_PATH=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
+          cp "$BIN_PATH" Payload/MyADASApp_Swift.app/MyADASApp_Swift
+          chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 2. 拷贝 AI 模型零件 (全路径扫描确保不漏)
+          # 3. 拷贝编译好的 CoreML 模型 (.mlmodelc)
+          # 假设你的模型在项目根目录或已编译目录
           find . -name "*.mlmodelc" -exec cp -r {} Payload/MyADASApp_Swift.app/ \;
-          find . -name "*.mlpackage" -exec cp -r {} Payload/MyADASApp_Swift.app/yolov8l.mlpackage \;
           
+          # 4. 拷贝 Info.plist
           cp Info.plist Payload/MyADASApp_Swift.app/
-          zip -r MyADASApp_Swift.ipa Payload
-          du -sh MyADASApp_Swift.ipa # 关键自检：如果小于 50MB，说明模型没进去
+          
+          # 5. 打包成 IPA
+          zip -r FSD_V4_Horizontal.ipa Payload
 
-      - name: Upload
+      - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FSD-V4-Master
-          path: MyADASApp_Swift.ipa
+          name: FSD-V4-Master-IPA
+          path: FSD_V4_Horizontal.ipa
