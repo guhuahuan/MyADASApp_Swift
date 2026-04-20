@@ -6,7 +6,7 @@ import CoreLocation
 import CoreMotion
 
 @main
-struct FSD_Final_App: App {
+struct FSD_V7_App: App {
     var body: some Scene {
         WindowGroup {
             FSDMasterView()
@@ -21,54 +21,46 @@ struct FSDMasterView: View {
     
     var body: some View {
         ZStack {
-            // 底层：相机流 (黑屏加固版)
             Color.black.edgesIgnoringSafeArea(.all)
             CameraPreview(session: engine.captureSession).edgesIgnoringSafeArea(.all)
             
-            // 中层：AI 渲染与 AR 绘图
             GeometryReader { geo in
                 Canvas { context, size in
-                    // 1. AR 轨迹线
                     drawARPath(context: context, size: size, roll: engine.roll)
                     
-                    // 2. 目标识别与测距
                     for detection in engine.detections {
                         let rect = engine.convertRect(detection.boundingBox, to: size)
                         let hazard = engine.calculateHazard(rect: rect, size: size)
-                        
                         let isDanger = hazard > engine.hazardThreshold
                         let color: Color = isDanger ? .red : (hazard > engine.hazardThreshold/2 ? .yellow : .green)
                         
                         drawTargetCorners(context: context, rect: rect, color: color, isDanger: isDanger)
                         
-                        // 动态测距公式
-                        let distance = engine.distanceK / (rect.width / size.width + 0.001)
+                        // 距离计算：加入硬件变焦系数的补偿
+                        // 变焦越大，物体看起来越大，需要用 zoomFactor 修正真实距离
+                        let opticalCompensation = engine.zoomFactor
+                        let distance = (engine.distanceK * opticalCompensation) / (rect.width / size.width + 0.001)
+                        
                         context.draw(Text("\(Int(distance))M").font(.system(size: 16, weight: .black)).foregroundColor(color), 
                                      at: CGPoint(x: rect.minX, y: rect.minY - 25))
                     }
                 }
             }
             
-            // 顶层：HUD 仪表盘
             VStack {
                 HUDHeader(engine: engine)
                 Spacer()
-                
-                // 实时调优面板
                 if showSettings {
                     TuningPanel(engine: engine, isPresented: $showSettings)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 } else {
-                    // 控制按钮
-                    HStack(spacing: 20) {
-                        Button(action: { withAnimation { showSettings = true } }) {
-                            Label("系统规格调优", systemImage: "slider.horizontal.3")
-                                .font(.system(size: 12, weight: .bold))
-                                .padding()
-                                .background(Color.black.opacity(0.7))
-                                .foregroundColor(.cyan)
-                                .clipShape(Capsule())
-                        }
+                    Button(action: { withAnimation { showSettings = true } }) {
+                        Label("工业视觉调参", systemImage: "camera.macro")
+                            .font(.system(size: 12, weight: .bold))
+                            .padding()
+                            .background(Color.black.opacity(0.8))
+                            .foregroundColor(.cyan)
+                            .clipShape(Capsule())
                     }
                     .padding(.bottom, 40)
                 }
@@ -77,7 +69,6 @@ struct FSDMasterView: View {
         .onAppear { engine.startSystems() }
     }
 
-    // AR 绘图逻辑
     func drawARPath(context: GraphicsContext, size: CGSize, roll: Double) {
         let shift = CGFloat(roll) * 130.0
         var p = Path(); p.move(to: CGPoint(x: size.width * 0.2, y: size.height))
@@ -97,21 +88,26 @@ struct FSDMasterView: View {
     }
 }
 
-// MARK: - 核心引擎
+// MARK: - 核心引擎 (工业级光路与预处理)
 class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detections: [Detection] = []
     @Published var currentSpeed: Double = 0
     @Published var roll: Double = 0
-    @Published var distanceK: Double = 12.0
-    @Published var hazardThreshold: Double = 0.6
+    
+    // 开放硬件级变焦控制，默认 1.8 倍（模拟长焦视野）
+    @Published var zoomFactor: Double = 1.8 {
+        didSet { updateCameraZoom() }
+    }
+    @Published var distanceK: Double = 6.0 // 基础K值
+    @Published var hazardThreshold: Double = 0.4
     @Published var isModelReady = false
     
     let captureSession = AVCaptureSession()
+    private var videoDeviceInput: AVCaptureDeviceInput?
     private let locationManager = CLLocationManager()
     private let motionManager = CMMotionManager()
-    private let synthesizer = AVSpeechSynthesizer() // 语音预警
+    private let synthesizer = AVSpeechSynthesizer()
     private var requests = [VNRequest]()
-    private var lastAlertTime: Date = Date()
     
     struct Detection { let label: String; let boundingBox: CGRect }
 
@@ -119,7 +115,6 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
         setupModel(); setupPermissions(); setupMotion()
     }
 
-    // 1. 相机与权限
     private func setupPermissions() {
         AVCaptureDevice.requestAccess(for: .video) { if $0 { self.setupCamera() } }
         locationManager.delegate = self
@@ -128,59 +123,76 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
     }
 
     private func setupCamera() {
-        if captureSession.isRunning { return }
         captureSession.beginConfiguration()
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: device) else { return }
-        if captureSession.canAddInput(input) { captureSession.addInput(input) }
+        captureSession.sessionPreset = .hd1920x1080 
+        
+        // 【关键修复】使用主摄，并通过硬件级的 videoZoomFactor 来实现真正的远端放大
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
+        
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            if captureSession.canAddInput(input) { 
+                captureSession.addInput(input) 
+                self.videoDeviceInput = input
+            }
+            
+            // 锁定自动对焦和初始焦距
+            try device.lockForConfiguration()
+            if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = true }
+            device.videoZoomFactor = CGFloat(min(zoomFactor, device.activeFormat.videoMaxZoomFactor))
+            device.unlockForConfiguration()
+            
+        } catch { print("Camera config failed.") }
+        
         let output = AVCaptureVideoDataOutput()
+        // 丢弃延迟帧，防止运动模糊影响模型推理
+        output.alwaysDiscardsLateVideoFrames = true 
         output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "vision_queue"))
         if captureSession.canAddOutput(output) { captureSession.addOutput(output) }
+        
         captureSession.commitConfiguration()
         DispatchQueue.global(qos: .userInitiated).async { self.captureSession.startRunning() }
     }
 
-    // 2. AI 模型加载 (YOLO)
+    // 动态更新物理镜头焦距
+    private func updateCameraZoom() {
+        guard let device = videoDeviceInput?.device else { return }
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = CGFloat(min(zoomFactor, device.activeFormat.videoMaxZoomFactor))
+            device.unlockForConfiguration()
+        } catch { print("Zoom failed") }
+    }
+
     private func setupModel() {
         guard let url = Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
               let model = try? VNCoreMLModel(for: MLModel(contentsOf: url, configuration: MLModelConfiguration())) else { return }
+        
         let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
             if let results = req.results as? [VNRecognizedObjectObservation] {
                 DispatchQueue.main.async {
                     self?.detections = results.compactMap { res in
                         let label = res.labels.first?.identifier ?? ""
-                        return ["car", "person", "truck", "bus"].contains(label) ? Detection(label: label, boundingBox: res.boundingBox) : nil
+                        // 置信度保持 0.35，过滤绝对噪点，放行远端特征
+                        if ["car", "person", "truck", "bus"].contains(label) && res.confidence > 0.35 {
+                            return Detection(label: label, boundingBox: res.boundingBox)
+                        }
+                        return nil
                     }
-                    self?.checkCollisionAlert()
                 }
             }
         }
-        request.imageCropAndScaleOption = .scaleFill
+        // 维持中心裁切，配合硬件 Zoom，实现双重放大
+        request.imageCropAndScaleOption = .centerCrop 
         self.requests = [request]
         DispatchQueue.main.async { self.isModelReady = true }
     }
 
-    // 3. 碰撞判定与语音预警
-    private func checkCollisionAlert() {
-        let hasDanger = detections.contains { 
-            calculateHazard(rect: convertRect($0.boundingBox, to: UIScreen.main.bounds.size), size: UIScreen.main.bounds.size) > hazardThreshold 
-        }
-        if hasDanger && Date().timeIntervalSince(lastAlertTime) > 3 {
-            let utterance = AVSpeechUtterance(string: "注意前方")
-            utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
-            utterance.rate = 0.6
-            synthesizer.speak(utterance)
-            lastAlertTime = Date()
-        }
-    }
-
-    // 4. 数据采集回调
     func captureOutput(_ o: AVCaptureOutput, didOutput b: CMSampleBuffer, from c: AVCaptureConnection) {
         guard let pb = CMSampleBufferGetImageBuffer(b) else { return }
         try? VNImageRequestHandler(cvPixelBuffer: pb, orientation: .up).perform(self.requests)
     }
 
-    // 5. 辅助计算
     func convertRect(_ rect: CGRect, to size: CGSize) -> CGRect {
         return CGRect(x: rect.minX * size.width, y: (1.0 - rect.maxY) * size.height, width: rect.width * size.width, height: rect.height * size.height)
     }
@@ -188,7 +200,7 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
     func calculateHazard(rect: CGRect, size: CGSize) -> Double {
         let areaFactor = (rect.width * rect.height) / (size.width * size.height)
         let centerFactor = 1.0 - abs((rect.midX / size.width) - 0.5) * 2.0
-        return rect.midY > size.height * 0.45 ? Double(areaFactor * 15.0 * centerFactor) : 0
+        return rect.midY > size.height * 0.45 ? Double(areaFactor * 18.0 * centerFactor) : 0
     }
 
     func locationManager(_ m: CLLocationManager, didUpdateLocations l: [CLLocation]) { currentSpeed = l.last?.speed ?? 0 }
@@ -199,20 +211,17 @@ class FSDCoreEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCa
     }
 }
 
-// MARK: - UI 装饰组件
+// MARK: - 组件层
 struct HUDHeader: View {
     @ObservedObject var engine: FSDCoreEngine
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 5) {
-                Text("FSD MASTER V6.0").font(.system(size: 12, weight: .black, design: .monospaced)).foregroundColor(.cyan)
-                StatusTag(text: engine.isModelReady ? "AI: ACTIVE" : "AI: LOADING", active: engine.isModelReady)
+                Text("FSD V7.0 OPTICAL").font(.system(size: 10, weight: .black, design: .monospaced)).foregroundColor(.cyan)
+                Text(engine.isModelReady ? "AI: RUNNING" : "AI: LOADING").font(.system(size: 7)).foregroundColor(engine.isModelReady ? .green : .red)
             }
             Spacer()
-            VStack(alignment: .trailing) {
-                Text("\(Int(engine.currentSpeed * 3.6))").font(.system(size: 55, weight: .black, design: .monospaced)).foregroundColor(.yellow)
-                Text("KM/H").font(.system(size: 12, weight: .bold)).foregroundColor(.yellow).offset(y: -10)
-            }
+            Text("\(Int(engine.currentSpeed * 3.6))").font(.system(size: 55, weight: .black, design: .monospaced)).foregroundColor(.yellow)
         }.padding(.top, 60).padding(.horizontal, 25)
     }
 }
@@ -221,22 +230,25 @@ struct TuningPanel: View {
     @ObservedObject var engine: FSDCoreEngine
     @Binding var isPresented: Bool
     var body: some View {
-        VStack(spacing: 25) {
-            TuningSlider(label: "测距基准系数 (K)", value: $engine.distanceK, range: 5...25)
-            TuningSlider(label: "碰撞报警灵敏度 (H)", value: $engine.hazardThreshold, range: 0.2...1.5)
-            Button("锁定并返回") { withAnimation { isPresented = false } }
-                .font(.system(size: 14, weight: .bold)).frame(maxWidth: .infinity).padding().background(Color.cyan).foregroundColor(.black).cornerRadius(12)
+        VStack(spacing: 20) {
+            // 新增硬件光路变焦控制
+            TuningSlider(label: "光学变焦 (Sensor Zoom)", value: $engine.zoomFactor, range: 1.0...3.0, color: .orange)
+            TuningSlider(label: "测距基准系数 (K)", value: $engine.distanceK, range: 2...15, color: .cyan)
+            TuningSlider(label: "预警灵敏阈值 (H)", value: $engine.hazardThreshold, range: 0.1...1.2, color: .red)
+            
+            Button("应用并返回") { withAnimation { isPresented = false } }
+                .font(.system(size: 14, weight: .bold)).frame(maxWidth: .infinity).padding(12).background(Color.blue).foregroundColor(.white).cornerRadius(10)
         }
-        .padding(30).background(BlurView(style: .systemUltraThinMaterialDark).cornerRadius(25)).padding(.horizontal, 20).padding(.bottom, 40)
+        .padding(25).background(BlurView(style: .systemUltraThinMaterialDark).cornerRadius(20)).padding(.horizontal, 15).padding(.bottom, 30)
     }
 }
 
 struct TuningSlider: View {
-    let label: String; @Binding var value: Double; let range: ClosedRange<Double>
+    let label: String; @Binding var value: Double; let range: ClosedRange<Double>; let color: Color
     var body: some View {
-        VStack(alignment: .leading) {
+        VStack(alignment: .leading, spacing: 5) {
             HStack { Text(label).font(.caption.bold()); Spacer(); Text(String(format: "%.1f", value)).monospacedDigit() }.foregroundColor(.white)
-            Slider(value: $value, in: range).accentColor(.cyan)
+            Slider(value: $value, in: range).accentColor(color)
         }
     }
 }
@@ -248,13 +260,6 @@ struct CameraPreview: UIViewRepresentable {
         l.videoGravity = .resizeAspectFill; l.frame = v.layer.bounds; v.layer.addSublayer(l); return v
     }
     func updateUIView(_ uiView: UIView, context: Context) {}
-}
-
-struct StatusTag: View {
-    let text: String; let active: Bool
-    var body: some View {
-        Text(text).font(.system(size: 8, weight: .black)).padding(4).background(active ? Color.cyan.opacity(0.3) : Color.red.opacity(0.3)).foregroundColor(active ? .cyan : .red).cornerRadius(4)
-    }
 }
 
 struct BlurView: UIViewRepresentable {
