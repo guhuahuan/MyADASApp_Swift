@@ -1,4 +1,4 @@
-name: FSD V4 ULTIMATE MASTER
+name: FSD V4 FINAL PACK
 
 on:
   push:
@@ -12,7 +12,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          lfs: true
+          lfs: true # 必须开启 LFS，否则你的模型会变成 1KB 报错
 
       - name: Create Info.plist
         run: |
@@ -22,22 +22,22 @@ jobs:
           <plist version="1.0">
           <dict>
               <key>CFBundleExecutable</key><string>MyADASApp_Swift</string>
-              <key>CFBundleIdentifier</key><string>com.fsd.v4.adas</string>
+              <key>CFBundleIdentifier</key><string>com.fsd.v4.master</string>
               <key>CFBundleName</key><string>FSD MASTER</string>
               <key>CFBundlePackageType</key><string>APPL</string>
               <key>CFBundleShortVersionString</key><string>4.0</string>
               <key>CFBundleVersion</key><string>1</string>
               <key>LSRequiresIPhoneOS</key><true/>
               <key>MinimumOSVersion</key><string>17.0</string>
-              <key>NSCameraUsageDescription</key><string>AI环境感知与分析</string>
-              <key>NSLocationWhenInUseUsageDescription</key><string>用于速度及航向计算</string>
+              <key>NSCameraUsageDescription</key><string>用于AI实时识别路况</string>
+              <key>NSLocationWhenInUseUsageDescription</key><string>用于速度与航向计算</string>
               <key>NSMotionUsageDescription</key><string>用于AR地平线实时修正</string>
               <key>UILaunchScreen</key><dict/>
           </dict>
           </plist>
           EOF
 
-      - name: Swift Build
+      - name: Build Binary
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           swift build -c release \
@@ -46,26 +46,26 @@ jobs:
             -Xcc -isysroot -Xcc "$SDK_PATH" \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 
-      - name: Package
+      - name: Assemble Full Package
         run: |
           rm -rf Payload
           mkdir -p Payload/MyADASApp_Swift.app
           
-          # 二进制拷贝
+          # 1. 拷贝主程序
           BIN=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod 755 Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 深度拷贝 AI 模型包 (全量拷贝确保 weight.bin 不丢失)
+          # 2. 拷贝 AI 模型零件 (全路径扫描确保不漏)
           find . -name "*.mlmodelc" -exec cp -r {} Payload/MyADASApp_Swift.app/ \;
           find . -name "*.mlpackage" -exec cp -r {} Payload/MyADASApp_Swift.app/yolov8l.mlpackage \;
           
           cp Info.plist Payload/MyADASApp_Swift.app/
           zip -r MyADASApp_Swift.ipa Payload
-          du -sh MyADASApp_Swift.ipa
+          du -sh MyADASApp_Swift.ipa # 关键自检：如果小于 50MB，说明模型没进去
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: FSD-V4-Ultimate-Master
+          name: FSD-V4-Master
           path: MyADASApp_Swift.ipa
