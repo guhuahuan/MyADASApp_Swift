@@ -1,20 +1,21 @@
-name: FSD V4.0 PRODUCTION BUILD
+name: FSD V4.0 PRODUCTION MASTER BUILD
 
 on:
   push:
     branches: [ main ]
+  workflow_dispatch: # 支持手动点击按钮触发构建
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-14 # 使用 macOS 14 环境以支持最新的 iOS 17 SDK
 
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          lfs: true # 必须开启 LFS 否则模型文件只是指针
+          lfs: true # 必须开启 LFS，否则 CoreML 大文件下载下来只是几个字节的指针
 
-      - name: Create Info.plist
+      - name: Setup Info.plist (Permissions & Landscape Lock)
         run: |
           cat <<EOF > Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
@@ -29,17 +30,42 @@ jobs:
               <key>CFBundleVersion</key><string>1</string>
               <key>LSRequiresIPhoneOS</key><true/>
               <key>MinimumOSVersion</key><string>17.0</string>
-              <key>NSCameraUsageDescription</key><string>AI道路感知与避障</string>
-              <key>NSLocationWhenInUseUsageDescription</key><string>计算时速与航向</string>
-              <key>NSMotionUsageDescription</key><string>3D轨迹动态修正</string>
+              
+              <key>NSCameraUsageDescription</key><string>需要访问相机以进行实时道路目标检测与碰撞预警。</string>
+              <key>NSLocationWhenInUseUsageDescription</key><string>需要访问 GPS 以计算车辆行驶速度与实时航向。</string>
+              <key>NSMotionUsageDescription</key><string>需要运动传感器数据以实现 3D 引导轨迹的动态姿态补偿。</string>
+              
               <key>UISupportedInterfaceOrientations</key>
-              <array><string>UIInterfaceOrientationLandscapeRight</string></array>
+              <array>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <key>UIInterfaceOrientation</key>
+              <string>UIInterfaceOrientationLandscapeRight</string>
+              
               <key>UILaunchScreen</key><dict/>
           </dict>
           </plist>
           EOF
 
-      - name: Swift Build
+      - name: Compile CoreML Model (Critical Step)
+        run: |
+          # 寻找原始模型文件 (例如 yolov8l.mlmodel)
+          RAW_MODEL=$(find . -name "*.mlmodel" | head -n 1)
+          
+          if [ -z "$RAW_MODEL" ]; then
+            echo "❌ Error: No .mlmodel file found in repository!"
+            exit 1
+          fi
+          
+          echo "🚀 Found model at $RAW_MODEL, starting compilation..."
+          
+          # 将模型编译为代码可识别的 .mlmodelc 文件夹
+          # 编译后的名称必须与 Swift 代码中的 name = "yolov8l" 对应
+          xcrun coremlcompiler compile "$RAW_MODEL" .
+          
+          echo "✅ Model compiled successfully: yolov8l.mlmodelc created."
+
+      - name: Build Swift Binary for iOS
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           swift build -c release \
@@ -48,24 +74,31 @@ jobs:
             -Xcc -isysroot -Xcc "$SDK_PATH" \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 
-      - name: Assemble & Verify IPA
+      - name: Assemble & Package IPA
         run: |
+          # 1. 创建标准的 iOS App 结构
           rm -rf Payload
           mkdir -p Payload/MyADASApp_Swift.app
           
-          # 1. 拷贝二进制
+          # 2. 拷贝编译好的二进制文件
           BIN=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 2. 拷贝模型 (强制校验)
-          MODEL=$(find . -name "*.mlmodelc" -type d | head -n 1)
-          if [ -z "$MODEL" ]; then echo "❌ Error: Model NOT found!"; exit 1; fi
-          cp -r "$MODEL" Payload/MyADASApp_Swift.app/
+          # 3. 拷贝编译后的模型文件夹 (.mlmodelc)
+          # 注意：这是 App 运行 AI 的核心，体积约在几十 MB 到 100MB+
+          cp -r yolov8l.mlmodelc Payload/MyADASApp_Swift.app/
           
-          # 3. 拷贝权限文件
+          # 4. 拷贝 Info.plist
           cp Info.plist Payload/MyADASApp_Swift.app/
           
-          # 4. 打包并检查体积
-          zip -r FSD_MASTER.ipa Payload
-          ls -lh FSD_MASTER.ipa
+          # 5. 打包成 IPA 并输出最终体积
+          zip -r FSD_V4_Production.ipa Payload
+          echo "--- FINAL IPA SIZE ---"
+          ls -lh FSD_V4_Production.ipa
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FSD-V4-Production-IPA
+          path: FSD_V4_Production.ipa
