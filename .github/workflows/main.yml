@@ -13,14 +13,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          lfs: true # 开启 LFS 支持
-
-      - name: Force LFS Pull
-        run: |
-          git lfs install
-          git lfs pull
-          # 检查模型文件大小，如果是几百字节说明 LFS 失败了
-          ls -lh *.mlmodel || echo "No direct mlmodel found"
+          lfs: true
 
       - name: Setup Info.plist
         run: |
@@ -68,30 +61,28 @@ jobs:
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 3. 【精准寻找】寻找模型源码并编译
-          # 增加 -maxdepth 2 避免深入 .build 文件夹
-          RAW_MODEL=$(find . -maxdepth 2 -name "*.mlmodel" -not -path "./.build/*" | head -n 1)
+          # 3. 【关键修复】直接指向你的 .mlpackage 路径
+          # 根据你的 ls 输出，路径是 Sources/yolov8l.mlpackage
+          SRC_PACKAGE="Sources/yolov8l.mlpackage"
           
-          if [ -z "$RAW_MODEL" ]; then
-            echo "❌ CRITICAL: No .mlmodel found in root or level 1!"
-            ls -R
+          if [ ! -d "$SRC_PACKAGE" ]; then
+            echo "❌ CRITICAL: Cannot find $SRC_PACKAGE"
             exit 1
           fi
           
-          echo "🚀 Found source model: $RAW_MODEL. Starting CoreML compilation..."
+          echo "🚀 Compiling MLPackage from $SRC_PACKAGE ..."
           
-          # 4. 编译到临时目录并重命名
-          mkdir -p temp_model
-          xcrun coremlcompiler compile "$RAW_MODEL" temp_model/
+          # 4. 编译模型并强制输出为代码需要的 yolov8l.mlmodelc
+          xcrun coremlcompiler compile "$SRC_PACKAGE" Payload/MyADASApp_Swift.app/
           
-          # 搜索编译出来的 .mlmodelc 文件夹并强制重命名为代码需要的 yolov8l.mlmodelc
-          COMPILED_DIR=$(find temp_model -name "*.mlmodelc" -type d | head -n 1)
-          if [ -d "$COMPILED_DIR" ]; then
-             cp -r "$COMPILED_DIR" Payload/MyADASApp_Swift.app/yolov8l.mlmodelc
-             echo "✅ Model successfully embedded."
+          # 检查编译结果。编译器通常会在目标目录下生成 yolov8l.mlmodelc
+          if [ -d "Payload/MyADASApp_Swift.app/yolov8l.mlmodelc" ]; then
+             echo "✅ Model successfully compiled into App Bundle."
           else
-             echo "❌ Error: Compilation output not found!"
-             exit 1
+             echo "⚠️ Renaming output if needed..."
+             # 有些版本可能生成名称不一致，强制修正
+             FOUND_C=$(find Payload/MyADASApp_Swift.app -name "*.mlmodelc" -type d | head -n 1)
+             mv "$FOUND_C" Payload/MyADASApp_Swift.app/yolov8l.mlmodelc
           fi
           
           # 5. 补充配置
