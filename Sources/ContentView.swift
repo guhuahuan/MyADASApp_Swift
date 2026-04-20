@@ -1,265 +1,183 @@
 import SwiftUI
-import Vision
 import AVFoundation
-import CoreMotion
+import Vision
+import CoreML
 import CoreLocation
-import CoreImage
-import CoreImage.CIFilterBuiltins
 
-// MARK: - 数据结构
-struct FSDV3Object: Identifiable, Sendable {
-    let id: UUID
-    var label: String
-    var distance: Float
-    var velocityVector: CGVector
-    var boundingBox: CGRect
-    var isSideHazard: Bool
-    var isCritical: Bool
+// MARK: - 1. App 入口
+@main
+struct FSD_V4_App: App {
+    var body: some Scene {
+        WindowGroup {
+            FSDMainView()
+        }
+    }
 }
 
-enum ADASCameraMode: String, Sendable {
-    case ultraWide = "CITY: WIDE-ANGLE (0.5x)"
-    case telephoto = "HIGHWAY: FOCUS (1x + ROI)"
+// MARK: - 2. 主 UI 界面
+struct FSDMainView: View {
+    @StateObject private var engine = ADASLogicEngine()
+    
+    var body: some View {
+        ZStack {
+            // 底层：实时相机预览
+            CameraPreview(session: engine.captureSession)
+                .edgesIgnoringSafeArea(.all)
+            
+            // 中层：AI 识别框渲染
+            Canvas { context, size in
+                for detection in engine.detections {
+                    let rect = engine.convertRect(detection.boundingBox, to: size)
+                    context.stroke(Path(rect), with: .color(.green), lineWidth: 2)
+                    context.draw(Text(detection.label).foregroundColor(.green), at: CGPoint(x: rect.minX, y: rect.minY - 10))
+                }
+            }
+            
+            // 顶层：仪表盘数据
+            VStack {
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text("FSD V4 ADAS").font(.headline).foregroundColor(.white)
+                        Text("Speed: \(Int(engine.currentSpeed * 3.6)) km/h").foregroundColor(.yellow)
+                    }
+                    Spacer()
+                    if engine.isModelLoaded {
+                        Image(systemName: "cpu.fill").foregroundColor(.green)
+                    } else {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
+                    }
+                }
+                .padding()
+                .background(Color.black.opacity(0.5))
+                
+                Spacer()
+                
+                if let error = engine.errorMessage {
+                    Text(error).background(Color.red).padding()
+                }
+            }
+        }
+        .onAppear { engine.checkPermissions() }
+    }
 }
 
-// MARK: - 视觉引擎
-@MainActor
-class FSDV3Engine: NSObject, ObservableObject {
-    @Published var cameraMode: ADASCameraMode = .ultraWide
-    @Published var trackedObjects: [FSDV3Object] = []
-    @Published var occupancyMask: CGImage?
-    @Published var sideWarning: Edge? = nil
-    @Published var currentSpeed: Double = 0.0
-    @Published var speedLimit: Int = 0
-    @Published var isNightMode: Bool = false
-    @Published var yawRate: Double = 0.0
-    @Published var autoPitch: Double = 0.0
+// MARK: - 3. 核心逻辑引擎 (AI + Camera + GPS)
+class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
+    @Published var detections: [Detection] = []
+    @Published var currentSpeed: CLLocationSpeed = 0
+    @Published var isModelLoaded = false
+    @Published var errorMessage: String?
     
-    // 关键：Swift 6 并发优化。internalMode 用于后台线程无锁读取
-    nonisolated(unsafe) private var internalMode: ADASCameraMode = .ultraWide
-    
-    private let session = AVCaptureSession()
-    private let queue = DispatchQueue(label: "com.fsd.v4.compute", qos: .userInteractive)
-    
-    nonisolated(unsafe) private let ciContext = CIContext(options: [.cacheIntermediates: false])
-    nonisolated(unsafe) private let motion = CMMotionManager()
+    let captureSession = AVCaptureSession()
     private let locationManager = CLLocationManager()
-    private let haptic = UIImpactFeedbackGenerator(style: .heavy)
+    private var requests = [VNRequest]()
     
-    nonisolated(unsafe) private var detModel: VNCoreMLModel?
-    nonisolated(unsafe) private var prevPositions: [String: CGPoint] = [:]
-    private var currentInput: AVCaptureDeviceInput?
+    struct Detection {
+        let label: String
+        let confidence: Float
+        let boundingBox: CGRect
+    }
 
     override init() {
         super.init()
-        setupSensors()
-        loadModel()
-        setupCamera()
-        haptic.prepare()
+        setupModel()
     }
 
-    private func setupSensors() {
+    // A. 安全加载模型：解决闪退的核心
+    private func setupModel() {
+        // 尝试多个可能的路径（GitHub Actions 编译后的 .mlmodelc 位置）
+        let modelName = "yolov8l"
+        guard let modelURL = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc") ??
+                           Bundle.main.url(forResource: "yolov8l.mlpackage/Data/com.apple.CoreML/model", withExtension: "mlmodelc") else {
+            self.errorMessage = "Missing Model: \(modelName)"
+            return
+        }
+
+        do {
+            let visionModel = try VNCoreMLModel(for: MLModel(contentsOf: modelURL))
+            let objectRecognition = VNCoreMLRequest(model: visionModel) { (request, error) in
+                self.processDetections(for: request)
+            }
+            objectRecognition.imageCropAndScaleOption = .scaleFill
+            self.requests = [objectRecognition]
+            self.isModelLoaded = true
+        } catch {
+            self.errorMessage = "Model Init Failed"
+        }
+    }
+
+    // B. 相机初始化
+    func checkPermissions() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized: setupCamera()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { if $0 { self.setupCamera() } }
+        default: self.errorMessage = "Camera Access Denied"
+        }
         locationManager.delegate = self
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
-        if motion.isDeviceMotionAvailable {
-            motion.deviceMotionUpdateInterval = 1/60
-            motion.startDeviceMotionUpdates(to: .main) { [weak self] data, _ in
-                guard let data = data, let self = self else { return }
-                self.autoPitch = 0.05 * data.attitude.pitch + 0.95 * self.autoPitch
-                self.yawRate = 0.15 * data.rotationRate.z + 0.85 * self.yawRate
-            }
-        }
-    }
-
-    private func loadModel() {
-        Task {
-            let config = MLModelConfiguration()
-            config.computeUnits = .all 
-            // 兼容 SPM 的资源加载方式
-            let modelURL = Bundle.module.url(forResource: "yolov8l", withExtension: "mlmodelc") ?? 
-                           Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc")
-            
-            if let url = modelURL,
-               let mDet = try? MLModel(contentsOf: url, configuration: config),
-               let vDet = try? VNCoreMLModel(for: mDet) {
-                self.detModel = vDet
-            }
-        }
-    }
-
-    nonisolated private func applyNightVision(to image: CIImage) -> CIImage {
-        let extent = image.extent
-        let vector = CIVector(cgRect: extent)
-        guard let avgFilter = CIFilter(name: "CIAreaAverage", parameters: [kCIInputImageKey: image, kCIInputExtentKey: vector])?.outputImage else { return image }
-        var bitmap = [UInt8](repeating: 0, count: 4)
-        ciContext.render(avgFilter, toBitmap: &bitmap, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: nil)
-        let luminance = Float(bitmap[0]) / 255.0
-        
-        Task { @MainActor in self.isNightMode = luminance < 0.35 }
-        
-        if luminance < 0.35 {
-            let exp = CIFilter.exposureAdjust(); exp.inputImage = image; exp.ev = 1.3
-            let color = CIFilter.colorControls(); color.inputImage = exp.outputImage; color.contrast = 1.25
-            return color.outputImage ?? image
-        }
-        return image
     }
 
     private func setupCamera() {
-        switchCamera(to: .ultraWide)
-        let output = AVCaptureVideoDataOutput()
-        output.setSampleBufferDelegate(self, queue: queue)
-        if session.canAddOutput(output) { session.addOutput(output) }
-        let capture = self.session
-        DispatchQueue.global(qos: .userInitiated).async { capture.startRunning() }
-    }
-
-    func updateSpeed(_ speed: Double) {
-        self.currentSpeed = speed
-        let target: ADASCameraMode = speed > 65.0 ? .telephoto : .ultraWide
-        if target != cameraMode {
-            switchCamera(to: target)
-            self.cameraMode = target
-            self.internalMode = target // 更新非隔离变量
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            if captureSession.canAddInput(input) { captureSession.addInput(input) }
+            
+            let output = AVCaptureVideoDataOutput()
+            output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
+            if captureSession.canAddOutput(output) { captureSession.addOutput(output) }
+            
+            // 异步启动 session，防止 Watchdog 杀掉 App
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.captureSession.startRunning()
+            }
+        } catch {
+            self.errorMessage = "Camera Setup Failed"
         }
     }
 
-    private func switchCamera(to mode: ADASCameraMode) {
-        session.beginConfiguration()
-        if let input = currentInput { session.removeInput(input) }
-        let type: AVCaptureDevice.DeviceType = (mode == .telephoto) ? .builtInWideAngleCamera : .builtInUltraWideCamera
-        guard let dev = AVCaptureDevice.default(type, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: dev) else { session.commitConfiguration(); return }
-        if session.canAddInput(input) { session.addInput(input); currentInput = input }
-        session.commitConfiguration()
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        try? handler.perform(self.requests)
+    }
+
+    private func processDetections(for request: VNRequest) {
+        DispatchQueue.main.async {
+            guard let results = request.results as? [VNRecognizedObjectObservation] else { return }
+            self.detections = results.map { res in
+                Detection(label: res.labels.first?.identifier ?? "Obj", 
+                          confidence: res.confidence, 
+                          boundingBox: res.boundingBox)
+            }
+        }
+    }
+    
+    // 坐标转换
+    func convertRect(_ rect: CGRect, to size: CGSize) -> CGRect {
+        return CGRect(x: rect.minX * size.width,
+                      y: (1 - rect.maxY) * size.height,
+                      width: rect.width * size.width,
+                      height: rect.height * size.height)
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        currentSpeed = locations.last?.speed ?? 0
     }
 }
 
-extension FSDV3Engine: AVCaptureVideoDataOutputSampleBufferDelegate, CLLocationManagerDelegate {
-    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard let loc = locations.last else { return }
-        let speed = max(0, loc.speed * 3.6)
-        Task { @MainActor in self.updateSpeed(speed) }
+// MARK: - 4. 预览组件
+struct CameraPreview: UIViewRepresentable {
+    let session: AVCaptureSession
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: UIScreen.main.bounds)
+        let layer = AVCaptureVideoPreviewLayer(session: session)
+        layer.videoGravity = .resizeAspectFill
+        layer.frame = view.layer.bounds
+        view.layer.addSublayer(layer)
+        return view
     }
-
-    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixel = CMSampleBufferGetImageBuffer(sampleBuffer), 
-              let model = self.detModel else { return }
-        
-        let rawCI = CIImage(cvPixelBuffer: pixel)
-        let processedCI = applyNightVision(to: rawCI)
-        
-        // 核心修复：直接读取非隔离的 internalMode
-        let currentMode = self.internalMode
-        
-        let detReq = VNCoreMLRequest(model: model) { req, _ in
-            if let results = req.results as? [VNRecognizedObjectObservation] {
-                Task { @MainActor in self.analyzeWorld(results) }
-            }
-        }
-        
-        if currentMode == .telephoto { 
-            detReq.regionOfInterest = CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6) 
-        }
-
-        let ocrReq = VNRecognizeTextRequest { req, _ in
-            if let results = req.results as? [VNRecognizedTextObservation] {
-                Task { @MainActor in
-                    for obs in results {
-                        if let top = obs.topCandidates(1).first, 
-                           let val = Int(top.string.filter({$0.isNumber})), val >= 20 { 
-                            self.speedLimit = val 
-                        }
-                    }
-                }
-            }
-        }
-
-        let segReq = VNGenerateForegroundInstanceMaskRequest()
-        try? VNImageRequestHandler(ciImage: processedCI, orientation: .right).perform([ocrReq, detReq, segReq])
-        
-        if let maskObs = segReq.results?.first, 
-           let cg = self.ciContext.createCGImage(CIImage(cvPixelBuffer: maskObs.instanceMask), 
-                                                from: CIImage(cvPixelBuffer: maskObs.instanceMask).extent) {
-            Task { @MainActor in self.occupancyMask = cg }
-        }
-    }
-
-    @MainActor
-    private func analyzeWorld(_ observations: [VNRecognizedObjectObservation]) {
-        var nextObjs: [FSDV3Object] = []
-        var sideAlert: Edge? = nil
-        for obs in observations {
-            let label = obs.labels.first?.identifier ?? "target"
-            let center = CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
-            let prev = prevPositions[label] ?? center
-            let vector = CGVector(dx: (center.x - prev.x) * 25, dy: (center.y - prev.y) * 25)
-            prevPositions[label] = center
-            
-            let dist = 1.2 / (Float(obs.boundingBox.minY) + Float(autoPitch) * 0.5 + 0.05)
-            let isSide = dist < 7.0 && (obs.boundingBox.midX < 0.25 || obs.boundingBox.midX > 0.75)
-            let isCrit = dist < 12.0 && obs.boundingBox.midX > 0.4 && obs.boundingBox.midX < 0.6
-            
-            if isSide { sideAlert = obs.boundingBox.midX < 0.5 ? .leading : .trailing }
-            if isCrit && vector.dy < -0.05 { haptic.impactOccurred() }
-            
-            nextObjs.append(FSDV3Object(id: UUID(), label: label, distance: dist, velocityVector: vector, boundingBox: obs.boundingBox, isSideHazard: isSide, isCritical: isCrit))
-        }
-        self.trackedObjects = nextObjs
-        self.sideWarning = sideAlert
-    }
-}
-
-// MARK: - 主视图
-struct FSDMasterView: View {
-    @StateObject var engine = FSDV3Engine()
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if let mask = engine.occupancyMask {
-                Image(decorative: mask, scale: 1.0).resizable().renderingMode(.template).foregroundColor(.cyan.opacity(0.3)).ignoresSafeArea()
-            }
-            GeometryReader { geo in
-                Path { path in
-                    let w = geo.size.width; let h = geo.size.height
-                    path.move(to: CGPoint(x: w * 0.5, y: h))
-                    let vY = h * (0.45 + engine.autoPitch * 0.1); let vX = w * 0.5 + (engine.yawRate * 150)
-                    let c1 = CGPoint(x: w * 0.5 + (engine.yawRate * 450), y: h * 0.8); let c2 = CGPoint(x: w * 0.5 + (engine.yawRate * 200), y: h * 0.6)
-                    path.addCurve(to: CGPoint(x: vX, y: vY), control1: c1, control2: c2)
-                }
-                .stroke(LinearGradient(colors: [.cyan.opacity(0.8), .blue.opacity(0)], startPoint: .bottom, endPoint: .top), style: StrokeStyle(lineWidth: 65, lineCap: .round, lineJoin: .round))
-                .blur(radius: 12).blendMode(.screen).opacity(engine.currentSpeed > 5 ? 0.65 : 0)
-            }
-            HStack {
-                Rectangle().fill(LinearGradient(colors: [.red.opacity(engine.sideWarning == .leading ? 0.8 : 0), .clear], startPoint: .leading, endPoint: .trailing)).frame(width: 85)
-                Spacer()
-                Rectangle().fill(LinearGradient(colors: [.clear, .red.opacity(engine.sideWarning == .trailing ? 0.8 : 0)], startPoint: .leading, endPoint: .trailing)).frame(width: 85)
-            }.ignoresSafeArea()
-            GeometryReader { geo in
-                ForEach(engine.trackedObjects) { obj in
-                    let rect = VNImageRectForNormalizedRect(obj.boundingBox, Int(geo.size.width), Int(geo.size.height))
-                    RoundedRectangle(cornerRadius: 2).stroke(obj.isCritical ? Color.red : (obj.isSideHazard ? Color.orange : Color.white), lineWidth: 1.5).frame(width: rect.width, height: rect.height).position(x: rect.midX, y: geo.size.height - rect.minY)
-                }
-            }
-            VStack {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading) {
-                        Text("\(Int(engine.currentSpeed))").font(.system(size: 55, weight: .black, design: .monospaced))
-                        Text("KM/H").font(.caption)
-                    }
-                    Spacer()
-                    if engine.speedLimit > 0 {
-                        ZStack { Circle().strokeBorder(Color.red, lineWidth: 5).background(Circle().fill(.white)); Text("\(engine.speedLimit)").font(.system(size: 20, weight: .bold)).foregroundColor(.black) }.frame(width: 55, height: 55)
-                    }
-                }.padding(30).foregroundColor(.white)
-                Spacer()
-            }
-        }
-    }
-}
-
-@main
-struct ADASApp: App {
-    var body: some Scene { WindowGroup { FSDMasterView() } }
+    func updateUIView(_ uiView: UIView, context: Context) {}
 }
