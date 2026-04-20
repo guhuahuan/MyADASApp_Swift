@@ -5,28 +5,32 @@
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleIdentifier</key>
-    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <string>com.fsd.v4.master</string>
     <key>CFBundleName</key>
-    <string>FSD_V4_ADAS</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
+    <string>FSD MASTER</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>4.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <key>MinimumOSVersion</key>
+    <string>17.0</string>
+
     <key>NSCameraUsageDescription</key>
-    <string>需要访问相机以进行实时的路况 AI 检测。</string>
+    <string>需要访问相机以进行实时道路目标检测和前车碰撞预警。</string>
+
     <key>NSLocationWhenInUseUsageDescription</key>
-    <string>需要位置信息以计算当前行驶速度。</string>
+    <string>需要访问位置信息以计算实时行驶速度和地理航向。</string>
+
     <key>NSMotionUsageDescription</key>
-    <string>需要访问陀螺仪以修正 3D 路径姿态。</string>
-    <key>UIApplicationSceneManifest</key>
-    <dict>
-        <key>UIApplicationSupportsMultipleScenes</key>
-        <false/>
-    </dict>
+    <string>需要访问陀螺仪数据以实现 3D 轨迹线的动态姿态补偿。</string>
+
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    
     <key>UILaunchScreen</key>
     <dict/>
 </dict>
