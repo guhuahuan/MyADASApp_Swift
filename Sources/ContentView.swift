@@ -4,7 +4,6 @@ import Vision
 import CoreML
 import CoreLocation
 
-// MARK: - App Entry
 @main
 struct FSD_V4_App: App {
     var body: some Scene {
@@ -14,41 +13,35 @@ struct FSD_V4_App: App {
     }
 }
 
-// MARK: - UI Layer
+// MARK: - 主 UI 界面
 struct FSDMainView: View {
     @StateObject private var engine = ADASLogicEngine()
     
     var body: some View {
         ZStack {
-            // 1. 相机底图
-            CameraPreview(session: engine.captureSession)
-                .edgesIgnoringSafeArea(.all)
+            CameraPreview(session: engine.captureSession).edgesIgnoringSafeArea(.all)
             
-            // 2. AI 识别层
-            GeometryReader { geo in
-                Canvas { context, size in
-                    for detection in engine.detections {
-                        let rect = engine.convertRect(detection.boundingBox, to: size)
-                        context.stroke(Path(rect), with: .color(.cyan), lineWidth: 2)
-                        
-                        var title = detection.label
-                        // --- 修复后的逻辑 ---
-                        if engine.currentSpeed > 0.5 {
-                            title += " \(String(format: "%.1f", engine.currentSpeed * 3.6))km/h"
-                        }
-                        
-                        context.draw(Text(title).font(.caption).bold().foregroundColor(.cyan), 
-                                     at: CGPoint(x: rect.minX, y: rect.minY - 10))
+            // AI 检测框
+            Canvas { context, size in
+                for detection in engine.detections {
+                    let rect = engine.convertRect(detection.boundingBox, to: size)
+                    context.stroke(Path(rect), with: .color(.cyan), lineWidth: 2)
+                    
+                    var title = detection.label
+                    if engine.currentSpeed > 0.5 {
+                        title += " \(String(format: "%.1f", engine.currentSpeed * 3.6))km/h"
                     }
+                    context.draw(Text(title).font(.caption).bold().foregroundColor(.cyan), 
+                                 at: CGPoint(x: rect.minX, y: rect.minY - 10))
                 }
             }
             
-            // 3. 仪表盘覆盖层
+            // 仪表盘
             VStack {
                 HStack {
                     VStack(alignment: .leading) {
                         Text("FSD V4 ADAS").font(.title3).bold().foregroundColor(.white)
-                        Text(engine.isModelLoaded ? "AI ACTIVE" : "AI LOADING...")
+                        Text(engine.isModelLoaded ? "AI 运行中" : "AI 模型加载失败")
                             .font(.caption).foregroundColor(engine.isModelLoaded ? .green : .red)
                     }
                     Spacer()
@@ -57,14 +50,12 @@ struct FSDMainView: View {
                         Text("KM/H").font(.caption).foregroundColor(.yellow)
                     }
                 }
-                .padding()
-                .background(LinearGradient(gradient: Gradient(colors: [.black.opacity(0.7), .clear]), startPoint: .top, endPoint: .bottom))
+                .padding().background(LinearGradient(gradient: Gradient(colors: [.black.opacity(0.7), .clear]), startPoint: .top, endPoint: .bottom))
                 
                 Spacer()
                 
                 if let err = engine.errorMessage {
-                    Text(err).font(.system(size: 12, design: .monospaced))
-                        .padding(8).background(Color.red).foregroundColor(.white).cornerRadius(5)
+                    Text(err).font(.system(size: 10, design: .monospaced)).padding(8).background(Color.red).foregroundColor(.white).cornerRadius(5)
                 }
             }
         }
@@ -72,7 +63,7 @@ struct FSDMainView: View {
     }
 }
 
-// MARK: - Logic Engine
+// MARK: - 逻辑引擎
 class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detections: [Detection] = []
     @Published var currentSpeed: CLLocationSpeed = 0
@@ -94,13 +85,17 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
     }
 
     private func setupModel() {
+        // 强化路径搜索逻辑
+        let modelName = "yolov8l"
         let possibleURLs = [
-            Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
-            Bundle.main.url(forResource: "yolov8l.mlpackage/Data/com.apple.CoreML/model", withExtension: "mlmodelc")
+            Bundle.main.url(forResource: modelName, withExtension: "mlmodelc"),
+            Bundle.main.url(forResource: "model", withExtension: "mlmodelc"),
+            Bundle.main.bundleURL.appendingPathComponent("\(modelName).mlmodelc"),
+            Bundle.main.bundleURL.appendingPathComponent("model.mlmodelc")
         ]
         
         guard let modelURL = possibleURLs.compactMap({ $0 }).first else {
-            self.errorMessage = "ERROR: YOLOv8L.mlmodelc not found"
+            self.errorMessage = "错误: 根目录未发现 \(modelName).mlmodelc"
             return
         }
 
@@ -110,18 +105,18 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
             let model = try MLModel(contentsOf: modelURL, configuration: config)
             let visionModel = try VNCoreMLModel(for: model)
             
-            let objectRecognition = VNCoreMLRequest(model: visionModel) { (request, error) in
+            let request = VNCoreMLRequest(model: visionModel) { (request, error) in
                 if let results = request.results as? [VNRecognizedObjectObservation] {
                     DispatchQueue.main.async {
                         self.detections = results.map { Detection(label: $0.labels.first?.identifier ?? "?", boundingBox: $0.boundingBox) }
                     }
                 }
             }
-            objectRecognition.imageCropAndScaleOption = .scaleFill
-            self.requests = [objectRecognition]
+            request.imageCropAndScaleOption = .scaleFill
+            self.requests = [request]
             self.isModelLoaded = true
         } catch {
-            self.errorMessage = "Model Load Failed: \(error.localizedDescription)"
+            self.errorMessage = "模型加载失败: \(error.localizedDescription)"
         }
     }
 
@@ -138,10 +133,7 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
         let output = AVCaptureVideoDataOutput()
         output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "vision_queue"))
         captureSession.addOutput(output)
-        
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.captureSession.startRunning()
-        }
+        DispatchQueue.global(qos: .userInitiated).async { self.captureSession.startRunning() }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
