@@ -1,4 +1,4 @@
-name: FSD V4.0 PRODUCTION MASTER BUILD
+name: FSD V6.0 VERTICAL PRODUCTION BUILD
 
 on:
   push:
@@ -23,19 +23,18 @@ jobs:
           <plist version="1.0">
           <dict>
               <key>CFBundleExecutable</key><string>MyADASApp_Swift</string>
-              <key>CFBundleIdentifier</key><string>com.fsd.v4.master</string>
+              <key>CFBundleIdentifier</key><string>com.fsd.v6.master</string>
               <key>CFBundleName</key><string>FSD MASTER</string>
               <key>CFBundlePackageType</key><string>APPL</string>
-              <key>CFBundleShortVersionString</key><string>4.0</string>
+              <key>CFBundleShortVersionString</key><string>6.0</string>
               <key>CFBundleVersion</key><string>1</string>
               <key>LSRequiresIPhoneOS</key><true/>
               <key>MinimumOSVersion</key><string>17.0</string>
-              <key>NSCameraUsageDescription</key><string>道路环境感知</string>
-              <key>NSLocationWhenInUseUsageDescription</key><string>速度计算</string>
-              <key>NSMotionUsageDescription</key><string>AR修正</string>
+              <key>NSCameraUsageDescription</key><string>需要访问相机以进行实时道路目标检测和前车碰撞预警。</string>
+              <key>NSLocationWhenInUseUsageDescription</key><string>需要访问位置信息以计算实时行驶速度和地理航向。</string>
+              <key>NSMotionUsageDescription</key><string>需要访问陀螺仪数据以实现 3D 轨迹线的动态姿态补偿。</string>
               <key>UISupportedInterfaceOrientations</key>
-              <array><string>UIInterfaceOrientationLandscapeRight</string></array>
-              <key>UIInterfaceOrientation</key><string>UIInterfaceOrientationLandscapeRight</string>
+              <array><string>UIInterfaceOrientationPortrait</string></array>
               <key>UILaunchScreen</key><dict/>
           </dict>
           </plist>
@@ -61,8 +60,7 @@ jobs:
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 3. 【关键修复】直接指向你的 .mlpackage 路径
-          # 根据你的 ls 输出，路径是 Sources/yolov8l.mlpackage
+          # 3. 模型编译逻辑 (保持你之前的有效修复)
           SRC_PACKAGE="Sources/yolov8l.mlpackage"
           
           if [ ! -d "$SRC_PACKAGE" ]; then
@@ -71,29 +69,23 @@ jobs:
           fi
           
           echo "🚀 Compiling MLPackage from $SRC_PACKAGE ..."
-          
-          # 4. 编译模型并强制输出为代码需要的 yolov8l.mlmodelc
           xcrun coremlcompiler compile "$SRC_PACKAGE" Payload/MyADASApp_Swift.app/
           
-          # 检查编译结果。编译器通常会在目标目录下生成 yolov8l.mlmodelc
-          if [ -d "Payload/MyADASApp_Swift.app/yolov8l.mlmodelc" ]; then
-             echo "✅ Model successfully compiled into App Bundle."
-          else
-             echo "⚠️ Renaming output if needed..."
-             # 有些版本可能生成名称不一致，强制修正
-             FOUND_C=$(find Payload/MyADASApp_Swift.app -name "*.mlmodelc" -type d | head -n 1)
+          # 检查并统一模型目录名称
+          FOUND_C=$(find Payload/MyADASApp_Swift.app -name "*.mlmodelc" -type d | head -n 1)
+          if [ "$FOUND_C" != "Payload/MyADASApp_Swift.app/yolov8l.mlmodelc" ]; then
              mv "$FOUND_C" Payload/MyADASApp_Swift.app/yolov8l.mlmodelc
           fi
           
-          # 5. 补充配置
+          # 4. 补充配置
           cp Info.plist Payload/MyADASApp_Swift.app/
           
-          # 6. 打包
-          zip -r FSD_V4_Production.ipa Payload
-          echo "Final Package Size: $(du -sh FSD_V4_Production.ipa)"
+          # 5. 打包
+          zip -r FSD_V6_Production.ipa Payload
+          echo "Final Package Size: $(du -sh FSD_V6_Production.ipa)"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: FSD-V4-Production-IPA
-          path: FSD_V4_Production.ipa
+          name: FSD-V6-Production-IPA
+          path: FSD_V6_Production.ipa
