@@ -4,7 +4,7 @@ import Vision
 import CoreML
 import CoreLocation
 
-// MARK: - 1. App 入口
+// MARK: - App Entry
 @main
 struct FSD_V4_App: App {
     var body: some Scene {
@@ -14,46 +14,56 @@ struct FSD_V4_App: App {
     }
 }
 
-// MARK: - 2. 主 UI 界面
+// MARK: - UI Layer
 struct FSDMainView: View {
     @StateObject private var engine = ADASLogicEngine()
     
     var body: some View {
         ZStack {
-            // 底层：实时相机预览
+            // 1. 相机底图
             CameraPreview(session: engine.captureSession)
                 .edgesIgnoringSafeArea(.all)
             
-            // 中层：AI 识别框渲染
-            Canvas { context, size in
-                for detection in engine.detections {
-                    let rect = engine.convertRect(detection.boundingBox, to: size)
-                    context.stroke(Path(rect), with: .color(.green), lineWidth: 2)
-                    context.draw(Text(detection.label).foregroundColor(.green), at: CGPoint(x: rect.minX, y: rect.minY - 10))
+            // 2. AI 识别层
+            GeometryReader { geo in
+                Canvas { context, size in
+                    for detection in engine.detections {
+                        let rect = engine.convertRect(detection.boundingBox, to: size)
+                        context.stroke(Path(rect), with: .color(.cyan), lineWidth: 2)
+                        
+                        var title = detection.label
+                        if let speed = engine.currentSpeed, speed > 0.5 {
+                            title += " \(String(format: "%.1f", speed * 3.6))km/h"
+                        }
+                        
+                        context.draw(Text(title).font(.caption).bold().foregroundColor(.cyan), 
+                                     at: CGPoint(x: rect.minX, y: rect.minY - 10))
+                    }
                 }
             }
             
-            // 顶层：仪表盘数据
+            // 3. 仪表盘覆盖层
             VStack {
                 HStack {
                     VStack(alignment: .leading) {
-                        Text("FSD V4 ADAS").font(.headline).foregroundColor(.white)
-                        Text("Speed: \(Int(engine.currentSpeed * 3.6)) km/h").foregroundColor(.yellow)
+                        Text("FSD V4 ADAS").font(.title3).bold().foregroundColor(.white)
+                        Text(engine.isModelLoaded ? "AI ACTIVE" : "AI LOADING...")
+                            .font(.caption).foregroundColor(engine.isModelLoaded ? .green : .red)
                     }
                     Spacer()
-                    if engine.isModelLoaded {
-                        Image(systemName: "cpu.fill").foregroundColor(.green)
-                    } else {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
+                    VStack(alignment: .trailing) {
+                        Text("\(Int(engine.currentSpeed * 3.6))").font(.system(size: 40, weight: .bold)).foregroundColor(.yellow)
+                        Text("KM/H").font(.caption).foregroundColor(.yellow)
                     }
                 }
                 .padding()
-                .background(Color.black.opacity(0.5))
+                .background(LinearGradient(gradient: Gradient(colors: [.black.opacity(0.7), .clear]), startPoint: .top, endPoint: .bottom))
                 
                 Spacer()
                 
-                if let error = engine.errorMessage {
-                    Text(error).background(Color.red).padding()
+                if let err = engine.errorMessage {
+                    Text(err).font(.system(size: 12, design: .monospaced))
+                        .padding(8).background(Color.red).foregroundColor(.white).cornerRadius(5)
                 }
             }
         }
@@ -61,7 +71,7 @@ struct FSDMainView: View {
     }
 }
 
-// MARK: - 3. 核心逻辑引擎 (AI + Camera + GPS)
+// MARK: - Logic Engine
 class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detections: [Detection] = []
     @Published var currentSpeed: CLLocationSpeed = 0
@@ -74,7 +84,6 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
     
     struct Detection {
         let label: String
-        let confidence: Float
         let boundingBox: CGRect
     }
 
@@ -83,37 +92,41 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
         setupModel()
     }
 
-    // A. 安全加载模型：解决闪退的核心
     private func setupModel() {
-        // 尝试多个可能的路径（GitHub Actions 编译后的 .mlmodelc 位置）
-        let modelName = "yolov8l"
-        guard let modelURL = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc") ??
-                           Bundle.main.url(forResource: "yolov8l.mlpackage/Data/com.apple.CoreML/model", withExtension: "mlmodelc") else {
-            self.errorMessage = "Missing Model: \(modelName)"
+        // 自动探测编译后的模型位置
+        let possibleURLs = [
+            Bundle.main.url(forResource: "yolov8l", withExtension: "mlmodelc"),
+            Bundle.main.url(forResource: "yolov8l.mlpackage/Data/com.apple.CoreML/model", withExtension: "mlmodelc")
+        ]
+        
+        guard let modelURL = possibleURLs.compactMap({ $0 }).first else {
+            self.errorMessage = "ERROR: YOLOv8L.mlmodelc not found in Bundle"
             return
         }
 
         do {
-            let visionModel = try VNCoreMLModel(for: MLModel(contentsOf: modelURL))
+            let config = MLModelConfiguration()
+            config.computeUnits = .all // 优先使用 NPU/GPU
+            let model = try MLModel(contentsOf: modelURL, configuration: config)
+            let visionModel = try VNCoreMLModel(for: model)
+            
             let objectRecognition = VNCoreMLRequest(model: visionModel) { (request, error) in
-                self.processDetections(for: request)
+                if let results = request.results as? [VNRecognizedObjectObservation] {
+                    DispatchQueue.main.async {
+                        self.detections = results.map { Detection(label: $0.labels.first?.identifier ?? "?", boundingBox: $0.boundingBox) }
+                    }
+                }
             }
             objectRecognition.imageCropAndScaleOption = .scaleFill
             self.requests = [objectRecognition]
             self.isModelLoaded = true
         } catch {
-            self.errorMessage = "Model Init Failed"
+            self.errorMessage = "Model Load Failed: \(error.localizedDescription)"
         }
     }
 
-    // B. 相机初始化
     func checkPermissions() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized: setupCamera()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { if $0 { self.setupCamera() } }
-        default: self.errorMessage = "Camera Access Denied"
-        }
+        AVCaptureDevice.requestAccess(for: .video) { if $0 { self.setupCamera() } }
         locationManager.delegate = self
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
@@ -121,46 +134,24 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
 
     private func setupCamera() {
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
-        do {
-            let input = try AVCaptureDeviceInput(device: device)
-            if captureSession.canAddInput(input) { captureSession.addInput(input) }
-            
-            let output = AVCaptureVideoDataOutput()
-            output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
-            if captureSession.canAddOutput(output) { captureSession.addOutput(output) }
-            
-            // 异步启动 session，防止 Watchdog 杀掉 App
-            DispatchQueue.global(qos: .userInitiated).async {
-                self.captureSession.startRunning()
-            }
-        } catch {
-            self.errorMessage = "Camera Setup Failed"
+        try? captureSession.addInput(AVCaptureDeviceInput(device: device))
+        let output = AVCaptureVideoDataOutput()
+        output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "vision_queue"))
+        captureSession.addOutput(output)
+        
+        // 关键：异步开启，防止启动闪退
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.captureSession.startRunning()
         }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        try? handler.perform(self.requests)
+        try? VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up).perform(self.requests)
     }
 
-    private func processDetections(for request: VNRequest) {
-        DispatchQueue.main.async {
-            guard let results = request.results as? [VNRecognizedObjectObservation] else { return }
-            self.detections = results.map { res in
-                Detection(label: res.labels.first?.identifier ?? "Obj", 
-                          confidence: res.confidence, 
-                          boundingBox: res.boundingBox)
-            }
-        }
-    }
-    
-    // 坐标转换
     func convertRect(_ rect: CGRect, to size: CGSize) -> CGRect {
-        return CGRect(x: rect.minX * size.width,
-                      y: (1 - rect.maxY) * size.height,
-                      width: rect.width * size.width,
-                      height: rect.height * size.height)
+        return CGRect(x: rect.minX * size.width, y: (1 - rect.maxY) * size.height, width: rect.width * size.width, height: rect.height * size.height)
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
@@ -168,7 +159,6 @@ class ADASLogicEngine: NSObject, ObservableObject, CLLocationManagerDelegate, AV
     }
 }
 
-// MARK: - 4. 预览组件
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
