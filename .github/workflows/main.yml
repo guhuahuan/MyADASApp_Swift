@@ -30,9 +30,9 @@ jobs:
               <key>CFBundleVersion</key><string>1</string>
               <key>LSRequiresIPhoneOS</key><true/>
               <key>MinimumOSVersion</key><string>17.0</string>
-              <key>NSCameraUsageDescription</key><string>AI道路检测</string>
-              <key>NSLocationWhenInUseUsageDescription</key><string>速度计算</string>
-              <key>NSMotionUsageDescription</key><string>AR补偿</string>
+              <key>NSCameraUsageDescription</key><string>AI道路环境感知</string>
+              <key>NSLocationWhenInUseUsageDescription</key><string>实时车速计算</string>
+              <key>NSMotionUsageDescription</key><string>3D轨迹AR修正</string>
               <key>UISupportedInterfaceOrientations</key>
               <array><string>UIInterfaceOrientationLandscapeRight</string></array>
               <key>UILaunchScreen</key><dict/>
@@ -49,44 +49,43 @@ jobs:
             -Xcc -isysroot -Xcc "$SDK_PATH" \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 
-      - name: Compile and Assemble IPA (Robust Logic)
+      - name: Compile and Assemble IPA
         run: |
-          # 1. 初始化目录
+          # 1. 初始化
           rm -rf Payload
           mkdir -p Payload/MyADASApp_Swift.app
           
-          # 2. 拷贝二进制文件
+          # 2. 拷贝二进制
           BIN=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 3. 动态寻找并编译模型
-          RAW_MODEL=$(find . -name "*.mlmodel" | head -n 1)
+          # 3. 【核心修正】寻找源码模型，排除 .build 目录
+          # 使用 -not -path 排除掉中间缓存文件
+          RAW_MODEL=$(find . -name "*.mlmodel" -not -path "./.build/*" | head -n 1)
+          
           if [ -z "$RAW_MODEL" ]; then
-            echo "❌ Error: No .mlmodel found in repo!"
+            echo "❌ Error: Source .mlmodel not found! Check your repo root."
             exit 1
           fi
           
-          echo "🚀 Compiling $RAW_MODEL ..."
-          # 编译到临时目录
-          mkdir -p temp_model
-          xcrun coremlcompiler compile "$RAW_MODEL" temp_model/
+          echo "🚀 Compiling source model: $RAW_MODEL"
           
-          # 4. 关键步骤：找到编译产物并重命名为代码指定的 yolov8l.mlmodelc
-          COMPILED_MODEL=$(find temp_model -name "*.mlmodelc" -type d | head -n 1)
-          if [ -n "$COMPILED_MODEL" ]; then
-            cp -r "$COMPILED_MODEL" Payload/MyADASApp_Swift.app/yolov8l.mlmodelc
-            echo "✅ Model successfully integrated as yolov8l.mlmodelc"
-          else
-            echo "❌ Error: Compilation failed, no .mlmodelc generated!"
-            exit 1
-          fi
+          # 4. 编译模型并强制输出到目标位置
+          # 我们直接编译到 App 包内，并确保它叫 yolov8l.mlmodelc
+          mkdir -p temp_compile
+          xcrun coremlcompiler compile "$RAW_MODEL" temp_compile/
           
-          # 5. 拷贝 Info.plist
+          # 找到编译后的文件夹并拷贝，改名为代码需要的名称
+          COMPILED_FOLDER=$(find temp_compile -name "*.mlmodelc" -type d | head -n 1)
+          cp -r "$COMPILED_FOLDER" Payload/MyADASApp_Swift.app/yolov8l.mlmodelc
+          
+          # 5. 补充 Info.plist
           cp Info.plist Payload/MyADASApp_Swift.app/
           
-          # 6. 打包
+          # 6. 最终打包
           zip -r FSD_V4_Production.ipa Payload
+          echo "--- BUILD SUCCESS ---"
           ls -lh FSD_V4_Production.ipa
 
       - name: Upload IPA
