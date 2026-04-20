@@ -19,7 +19,6 @@ jobs:
 
       - name: Create Info.plist
         run: |
-          # 增加几个系统强制校验的 Key，防止安装器拒绝识别
           cat <<EOF > Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -48,7 +47,6 @@ jobs:
           swift package clean
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
-          # 编译逻辑
           swift build -c release \
             --triple arm64-apple-ios17.0 \
             -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
@@ -58,33 +56,23 @@ jobs:
 
       - name: Package as IPA
         run: |
-          # 确保清理旧的打包目录
           rm -rf Payload
           mkdir -p Payload/MyADASApp_Swift.app
           
-          # 1. 查找并拷贝二进制
+          # 拷贝二进制文件
           BINARY_PATH=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
           cp "$BINARY_PATH" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod 755 Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 2. 拷贝 Info.plist (这是灵魂)
+          # 拷贝资源文件
           cp Info.plist Payload/MyADASApp_Swift.app/Info.plist
-          
-          # 3. 拷贝模型
-          echo "Packing AI Models..."
-          find .build -name "*.mlmodelc" -exec cp -r {} Payload/MyADASApp_Swift.app/ \;
-          
-          if [ ! -d Payload/MyADASApp_Swift.app/*.mlmodelc ]; then
-            cp -r Sources/yolov8l.mlpackage Payload/MyADASApp_Swift.app/
-          fi
-
-          # 4. 关键：创建 PkgInfo 文件 (虽然不是必须，但能提高兼容性)
           echo "APPL????" > Payload/MyADASApp_Swift.app/PkgInfo
           
-          # 5. 执行打包：注意这里必须在当前目录下打包 Payload
-          # 我们先检查一下结构
-          ls -R Payload/
+          # 拷贝模型
+          find .build -name "*.mlmodelc" -exec cp -r {} Payload/MyADASApp_Swift.app/ \;
           
+          # 检查大小并打包
+          du -sh Payload/MyADASApp_Swift.app
           zip -r MyADASApp_Swift.ipa Payload
           
       - name: Upload Artifact
@@ -92,4 +80,3 @@ jobs:
         with:
           name: FSD-ADAS-Package
           path: MyADASApp_Swift.ipa
-          if-no-files-found: error
