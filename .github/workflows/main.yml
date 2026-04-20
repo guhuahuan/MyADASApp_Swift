@@ -47,11 +47,11 @@ jobs:
           swift package clean
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           
+          # 强制指定编译产物路径
           swift build -c release \
             --triple arm64-apple-ios17.0 \
             -Xswiftc -sdk -Xswiftc "$SDK_PATH" \
             -Xcc -isysroot -Xcc "$SDK_PATH" \
-            -Xcc --target=arm64-apple-ios17.0 \
             -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker Info.plist
 
       - name: Package as IPA
@@ -59,22 +59,34 @@ jobs:
           rm -rf Payload
           mkdir -p Payload/MyADASApp_Swift.app
           
-          # 拷贝二进制文件
-          BINARY_PATH=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
+          # 1. 拷贝二进制执行文件 (这是核心，如果这里漏了，包就会很小)
+          # 我们使用更宽泛的搜索模式，并打印路径以便确认
+          BINARY_PATH=$(find .build/arm64-apple-ios17.0/release -type f -maxdepth 1 -perm +111 | head -n 1)
+          echo "Found Binary at: $BINARY_PATH"
           cp "$BINARY_PATH" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod 755 Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 拷贝资源文件
+          # 2. 拷贝关键元数据
           cp Info.plist Payload/MyADASApp_Swift.app/Info.plist
           echo "APPL????" > Payload/MyADASApp_Swift.app/PkgInfo
           
-          # 拷贝模型
-          find .build -name "*.mlmodelc" -exec cp -r {} Payload/MyADASApp_Swift.app/ \;
+          # 3. 递归拷贝模型文件夹 (这是体积大的原因)
+          # 检查编译后的模型目录是否存在，如果不存在则从 Sources 直接拷贝
+          if [ -d ".build/arm64-apple-ios17.0/release/yolov8l.mlmodelc" ]; then
+            cp -r .build/arm64-apple-ios17.0/release/yolov8l.mlmodelc Payload/MyADASApp_Swift.app/
+          else
+            echo "Warning: mlmodelc not found in build dir, checking Sources..."
+            # 如果 Sources 里是 mlpackage，需要确保它已被处理成 mlmodelc
+            cp -r Sources/*.mlpackage Payload/MyADASApp_Swift.app/ || true
+          fi
           
-          # 检查大小并打包
-          du -sh Payload/MyADASApp_Swift.app
+          # 4. 打印最终 App 目录结构，方便在 Actions 日志里 Debug
+          ls -R Payload/
+          
+          # 5. 打包并检查大小
           zip -r MyADASApp_Swift.ipa Payload
-          
+          du -sh MyADASApp_Swift.ipa
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
