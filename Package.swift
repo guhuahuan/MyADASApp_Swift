@@ -10,10 +10,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "MyADASApp_Swift",
-            dependencies: [],
             path: "Sources",
             resources: [
-                // 关键点：改为你新上传的模型文件名
                 .process("yolo26x.mlpackage")
             ]
         )
