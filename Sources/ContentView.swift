@@ -5,135 +5,161 @@ import CoreML
 
 // MARK: - App 入口
 @main
-struct MiniDetectorApp: App {
+struct FSD_Mini_App: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            MainDetectionView()
         }
     }
 }
 
-// MARK: - 核心引擎
-class DetectionEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+// MARK: - 核心感知引擎
+class FSDCoreEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detections: [VNRecognizedObjectObservation] = []
+    @Published var modelStatus: String = "初始化中..."
+    @Published var isReady: Bool = false
     
     let session = AVCaptureSession()
     private var requests = [VNRequest]()
     
-    // 根据元数据，yolo26x 标签是小写
-    private let targetLabels = ["person", "car", "truck", "bus", "motorcycle"]
+    // 根据你提供的元数据：0: person, 2: car, 5: bus, 7: truck
+    private let targetLabels = ["person", "car", "bus", "truck"]
 
-    func setup() {
-        // 1. 相机配置 (720P 兼顾性能与识别距离)
+    func startup() {
+        configureCamera()
+        configureModel()
+    }
+
+    private func configureCamera() {
         session.sessionPreset = .hd1280x720
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
-              let input = try? AVCaptureDeviceInput(device: device) else { return }
+              let input = try? AVCaptureDeviceInput(device: device) else { 
+            self.modelStatus = "❌ 无法访问相机"
+            return 
+        }
         if session.canAddInput(input) { session.addInput(input) }
         
         let output = AVCaptureVideoDataOutput()
-        output.alwaysDiscardsLateVideoFrames = true
-        output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "vision_processing_queue"))
+        output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "vision_queue"))
         if session.canAddOutput(output) { session.addOutput(output) }
         
-        // 2. 加载 yolo26x 模型
-        configureModel()
-        
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.session.startRunning()
-        }
+        DispatchQueue.global().async { self.session.startRunning() }
     }
 
     private func configureModel() {
-        // 获取本地编译后的模型路径
+        // 1. 尝试定位编译后的模型
         guard let modelURL = Bundle.main.url(forResource: "yolo26x", withExtension: "mlmodelc") else {
-            print("❌ 找不到 yolo26x.mlmodelc")
+            DispatchQueue.main.async { 
+                self.modelStatus = "❌ 找不到 yolo26x.mlmodelc"
+                self.isReady = false
+            }
             return
         }
-        
+
         do {
             let config = MLModelConfiguration()
-            config.computeUnits = .all // 强制开启 Neural Engine 加速
+            config.computeUnits = .all // 强制开启 Neural Engine
             
             let model = try VNCoreMLModel(for: MLModel(contentsOf: modelURL, configuration: config))
             
-            let request = VNCoreMLRequest(model: model) { [weak self] req, error in
+            let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
                 if let results = req.results as? [VNRecognizedObjectObservation] {
                     DispatchQueue.main.async {
-                        // 过滤目标并设置 0.25 的置信度阈值
+                        // 过滤目标并将阈值设为 0.3
                         self?.detections = results.filter { obs in
                             let label = obs.labels.first?.identifier ?? ""
-                            return (self?.targetLabels.contains(label) ?? false) && obs.confidence > 0.25
+                            return (self?.targetLabels.contains(label) ?? false) && obs.confidence > 0.3
                         }
                     }
                 }
             }
             
-            // 关键：针对 imgsz [640, 640] 进行填充缩放，不剪裁边缘
+            // 适配你的 imgsz [640, 640]
             request.imageCropAndScaleOption = .scaleFill
             self.requests = [request]
             
+            DispatchQueue.main.async {
+                self.modelStatus = "✅ YOLO26x 加载成功"
+                self.isReady = true
+            }
         } catch {
-            print("❌ 模型初始化失败: \(error)")
+            DispatchQueue.main.async { 
+                self.modelStatus = "❌ 加载失败: \(error.localizedDescription)"
+                self.isReady = false
+            }
         }
     }
 
-    // 相机回调
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        
-        // 由于是前置/后置摄像头，通常需要指定 orientation 为 .up
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        do {
-            try handler.perform(self.requests)
-        } catch {
-            print("❌ 推理失败: \(error)")
-        }
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
+        try? handler.perform(self.requests)
     }
 }
 
-// MARK: - 渲染层
-struct ContentView: View {
-    @StateObject private var engine = DetectionEngine()
+// MARK: - 主视图层
+struct MainDetectionView: View {
+    @StateObject private var engine = FSDCoreEngine()
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                // 1. 底层相机流
-                CameraView(session: engine.session)
+                // 相机预览
+                CameraPreviewView(session: engine.session)
                     .ignoresSafeArea()
                 
-                // 2. 识别框层
+                // 绘制层
                 Canvas { context, size in
                     for obs in engine.detections {
-                        // 坐标转换：Vision(0~1, Y向上) -> SwiftUI(绝对像素, Y向下)
+                        // 坐标转换
                         let rect = VNImageRectForNormalizedRect(obs.boundingBox, Int(size.width), Int(size.height))
                         let correctedRect = CGRect(x: rect.minX, y: size.height - rect.maxY, width: rect.width, height: rect.height)
                         
                         let label = obs.labels.first?.identifier ?? ""
                         let isPerson = label == "person"
-                        let themeColor: Color = isPerson ? .cyan : .green
+                        let color: Color = isPerson ? .cyan : .green
                         
-                        // 绘制外框
-                        context.stroke(Path(correctedRect), with: .color(themeColor), lineWidth: 3)
+                        // 画框
+                        context.stroke(Path(correctedRect), with: .color(color), lineWidth: 3)
                         
-                        // 绘制标签背景
-                        let text = Text(label.uppercased())
-                            .font(.system(size: 12, weight: .black, design: .monospaced))
+                        // 画标签
+                        let text = Text("\(label.uppercased()) \(Int(obs.confidence * 100))%")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
                             .foregroundColor(.black)
                         
-                        let textPos = CGPoint(x: correctedRect.minX + 5, y: correctedRect.minY + 10)
-                        context.fill(Path(CGRect(x: correctedRect.minX, y: correctedRect.minY - 20, width: 80, height: 20)), with: .color(themeColor))
-                        context.draw(text, at: textPos, anchor: .topLeading)
+                        context.fill(Path(CGRect(x: correctedRect.minX, y: correctedRect.minY - 20, width: 100, height: 20)), with: .color(color))
+                        context.draw(text, at: CGPoint(x: correctedRect.minX + 5, y: correctedRect.minY - 10), anchor: .leading)
                     }
+                }
+                
+                // 状态指示灯（用于排查模型加载）
+                VStack {
+                    HStack {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(engine.isReady ? Color.green : Color.red)
+                                .frame(width: 10, height: 10)
+                            Text(engine.modelStatus)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white)
+                        }
+                        .padding(8)
+                        .background(Color.black.opacity(0.7))
+                        .cornerRadius(8)
+                        Spacer()
+                    }
+                    .padding(.top, 50)
+                    .padding(.leading, 20)
+                    Spacer()
                 }
             }
         }
-        .onAppear { engine.setup() }
+        .onAppear { engine.startup() }
     }
 }
 
-// MARK: - UIKit 相机桥接
-struct CameraView: UIViewRepresentable {
+// MARK: - UIKit 桥接组件
+struct CameraPreviewView: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
         let view = UIView(frame: UIScreen.main.bounds)
