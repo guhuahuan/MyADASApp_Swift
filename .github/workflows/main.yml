@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          lfs: true
+          lfs: true # 必须开启，确保从 Git LFS 拉取真实的 weight.bin 而非指针
 
       - name: Setup Info.plist
         run: |
@@ -30,12 +30,10 @@ jobs:
               <key>CFBundleVersion</key><string>1</string>
               <key>LSRequiresIPhoneOS</key><true/>
               <key>MinimumOSVersion</key><string>17.0</string>
-              <key>NSCameraUsageDescription</key><string>需要访问相机以进行实时道路目标检测和前车碰撞预警。</string>
-              <key>NSLocationWhenInUseUsageDescription</key><string>需要访问位置信息以计算实时行驶速度和地理航向。</string>
-              <key>NSMotionUsageDescription</key><string>需要访问陀螺仪数据以实现 3D 轨迹线的动态姿态补偿。</string>
+              <key>NSCameraUsageDescription</key><string>需要访问相机以进行实时道路目标检测。</string>
+              <key>UILaunchScreen</key><dict/>
               <key>UISupportedInterfaceOrientations</key>
               <array><string>UIInterfaceOrientationPortrait</string></array>
-              <key>UILaunchScreen</key><dict/>
           </dict>
           </plist>
           EOF
@@ -60,21 +58,26 @@ jobs:
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 3. 模型编译逻辑 (保持你之前的有效修复)
-          SRC_PACKAGE="Sources/yolov8l.mlpackage"
+          # 3. 模型编译逻辑 (更新为 yolo26x)
+          SRC_PACKAGE="Sources/yolo26x.mlpackage"
           
           if [ ! -d "$SRC_PACKAGE" ]; then
             echo "❌ CRITICAL: Cannot find $SRC_PACKAGE"
+            ls -R Sources/ # 打印目录结构以便排查
             exit 1
           fi
           
           echo "🚀 Compiling MLPackage from $SRC_PACKAGE ..."
+          # 将 mlpackage 编译成 app 内可用的 mlmodelc
           xcrun coremlcompiler compile "$SRC_PACKAGE" Payload/MyADASApp_Swift.app/
           
-          # 检查并统一模型目录名称
+          # 检查并修正模型目录名称，确保与代码中的 Bundle.main.url(forResource: "yolo26x"...) 一致
           FOUND_C=$(find Payload/MyADASApp_Swift.app -name "*.mlmodelc" -type d | head -n 1)
-          if [ "$FOUND_C" != "Payload/MyADASApp_Swift.app/yolov8l.mlmodelc" ]; then
-             mv "$FOUND_C" Payload/MyADASApp_Swift.app/yolov8l.mlmodelc
+          TARGET_C="Payload/MyADASApp_Swift.app/yolo26x.mlmodelc"
+          
+          if [ -d "$FOUND_C" ] && [ "$FOUND_C" != "$TARGET_C" ]; then
+              echo "🔄 Renaming $FOUND_C to $TARGET_C"
+              mv "$FOUND_C" "$TARGET_C"
           fi
           
           # 4. 补充配置
