@@ -47,21 +47,33 @@ jobs:
 
       - name: Assemble IPA
         run: |
+          # 1. 准备目录
           mkdir -p Payload/MyADASApp_Swift.app
+          
+          # 2. 拷贝二进制
           BIN=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 核心：编译 yolo26x 模型
+          # 3. 核心：编译 yolo26x 模型
           SRC_PACKAGE="Sources/yolo26x.mlpackage"
           xcrun coremlcompiler compile "$SRC_PACKAGE" Payload/MyADASApp_Swift.app/
           
-          # 统一名称以便代码调用
+          # 4. 统一名称以便代码调用 (增加安全判断，防范自移动报错)
           FOUND_C=$(find Payload/MyADASApp_Swift.app -name "*.mlmodelc" -type d | head -n 1)
-          mv "$FOUND_C" Payload/MyADASApp_Swift.app/yolo26x.mlmodelc
+          TARGET_C="Payload/MyADASApp_Swift.app/yolo26x.mlmodelc"
           
+          if [ -d "$FOUND_C" ] && [ "$FOUND_C" != "$TARGET_C" ]; then
+              echo "🔄 Renaming $FOUND_C to $TARGET_C"
+              mv "$FOUND_C" "$TARGET_C"
+          else
+              echo "✅ Model is already named correctly or not found."
+          fi
+          
+          # 5. 补充配置与打包
           cp Info.plist Payload/MyADASApp_Swift.app/
           zip -r FSD_Production.ipa Payload
+          echo "Final Package Size: $(du -sh FSD_Production.ipa)"
 
       - name: Upload
         uses: actions/upload-artifact@v4
