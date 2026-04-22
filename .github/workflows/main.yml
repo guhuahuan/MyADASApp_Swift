@@ -47,36 +47,30 @@ jobs:
 
       - name: Assemble IPA
         run: |
-          # 1. 准备目录
+          # 1. 准备 Payload 目录
           mkdir -p Payload/MyADASApp_Swift.app
           
-          # 2. 拷贝二进制
+          # 2. 拷贝 Swift 二进制文件
           BIN=$(find .build -type f -name "MyADASApp_Swift" | grep "release" | head -n 1)
           cp "$BIN" Payload/MyADASApp_Swift.app/MyADASApp_Swift
           chmod +x Payload/MyADASApp_Swift.app/MyADASApp_Swift
           
-          # 3. 核心：编译 yolo26x 模型
+          # 3. 【核心修复】手动编译 CoreML 模型
+          # .mlpackage 必须通过 coremlcompiler 变成 .mlmodelc 才能被代码加载
           SRC_PACKAGE="Sources/yolo26x.mlpackage"
+          echo "🚀 Starting CoreML Compilation..."
           xcrun coremlcompiler compile "$SRC_PACKAGE" Payload/MyADASApp_Swift.app/
           
-          # 4. 统一名称以便代码调用 (增加安全判断，防范自移动报错)
+          # 4. 确保文件夹名称严格匹配代码中的调用名
+          # 有时编译器会生成类似 model.mlmodelc，我们要把它改回 yolo26x.mlmodelc
           FOUND_C=$(find Payload/MyADASApp_Swift.app -name "*.mlmodelc" -type d | head -n 1)
-          TARGET_C="Payload/MyADASApp_Swift.app/yolo26x.mlmodelc"
-          
-          if [ -d "$FOUND_C" ] && [ "$FOUND_C" != "$TARGET_C" ]; then
-              echo "🔄 Renaming $FOUND_C to $TARGET_C"
-              mv "$FOUND_C" "$TARGET_C"
-          else
-              echo "✅ Model is already named correctly or not found."
+          if [ -n "$FOUND_C" ] && [ "$FOUND_C" != "Payload/MyADASApp_Swift.app/yolo26x.mlmodelc" ]; then
+              mv "$FOUND_C" Payload/MyADASApp_Swift.app/yolo26x.mlmodelc
           fi
           
-          # 5. 补充配置与打包
+          # 5. 放入 Info.plist
           cp Info.plist Payload/MyADASApp_Swift.app/
+          
+          # 6. 打包
           zip -r FSD_Production.ipa Payload
-          echo "Final Package Size: $(du -sh FSD_Production.ipa)"
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: FSD-Production-IPA
-          path: FSD_Production.ipa
+          echo "✅ IPA Created Successfully."
