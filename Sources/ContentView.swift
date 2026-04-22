@@ -4,7 +4,7 @@ import Vision
 import CoreML
 
 @main
-struct MiniDetectorApp: App {
+struct FSD_App: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -12,34 +12,33 @@ struct MiniDetectorApp: App {
     }
 }
 
-// MARK: - 极简引擎
 class DetectionEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var detections: [VNRecognizedObjectObservation] = []
     let session = AVCaptureSession()
     private var requests = [VNRequest]()
 
     func setup() {
-        // 1. 相机配置
         session.sessionPreset = .hd1280x720
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device) else { return }
-        session.addInput(input)
+        if session.canAddInput(input) { session.addInput(input) }
         
         let output = AVCaptureVideoDataOutput()
         output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "video_queue"))
-        session.addOutput(output)
+        if session.canAddOutput(output) { session.addOutput(output) }
         
-        // 2. 加载 yolo26x 模型
+        // 关键：对应 yolo26x
         guard let modelURL = Bundle.main.url(forResource: "yolo26x", withExtension: "mlmodelc"),
-              let visionModel = try? VNCoreMLModel(for: MLModel(contentsOf: modelURL)) else { return }
+              let visionModel = try? VNCoreMLModel(for: MLModel(contentsOf: modelURL)) else { 
+            print("模型加载失败"); return 
+        }
         
         let request = VNCoreMLRequest(model: visionModel) { [weak self] request, _ in
             if let results = request.results as? [VNRecognizedObjectObservation] {
                 DispatchQueue.main.async {
-                    // 核心逻辑：只过滤人 (person) 和 车 (car)
-                    self?.detections = results.filter { 
-                        $0.labels.first?.identifier == "person" || $0.labels.first?.identifier == "car"
-                    }
+                    // 只保留人 (person) 和 车 (car/truck/bus)
+                    let allowed = ["person", "car", "truck", "bus"]
+                    self?.detections = results.filter { allowed.contains($0.labels.first?.identifier ?? "") }
                 }
             }
         }
@@ -55,7 +54,6 @@ class DetectionEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     }
 }
 
-// MARK: - 主视图
 struct ContentView: View {
     @StateObject private var engine = DetectionEngine()
 
@@ -63,23 +61,22 @@ struct ContentView: View {
         GeometryReader { geo in
             ZStack {
                 CameraView(session: engine.session)
-                
-                // 绘制识别框
                 ForEach(0..<engine.detections.count, id: \.self) { i in
                     let obs = engine.detections[i]
                     let rect = VNImageRectForNormalizedRect(obs.boundingBox, Int(geo.size.width), Int(geo.size.height))
-                    
-                    // 翻转坐标系（Vision 的 Y 轴向上，SwiftUI 向下）
                     let correctedRect = CGRect(x: rect.minX, y: geo.size.height - rect.maxY, width: rect.width, height: rect.height)
+                    
+                    let label = obs.labels.first?.identifier ?? ""
+                    let isPerson = label == "person"
                     
                     Rectangle()
                         .path(in: correctedRect)
-                        .stroke(obs.labels.first?.identifier == "person" ? Color.blue : Color.green, lineWidth: 3)
+                        .stroke(isPerson ? Color.blue : Color.green, lineWidth: 3)
                         .overlay(
-                            Text(obs.labels.first?.identifier.uppercased() ?? "")
+                            Text(label.uppercased())
                                 .font(.caption.bold())
                                 .foregroundColor(.white)
-                                .background(obs.labels.first?.identifier == "person" ? Color.blue : Color.green)
+                                .background(isPerson ? Color.blue : Color.green)
                                 .position(x: correctedRect.minX + 25, y: correctedRect.minY - 10)
                         )
                 }
@@ -90,7 +87,6 @@ struct ContentView: View {
     }
 }
 
-// MARK: - 相机预览层
 struct CameraView: UIViewRepresentable {
     let session: AVCaptureSession
     func makeUIView(context: Context) -> UIView {
